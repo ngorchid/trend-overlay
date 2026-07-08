@@ -260,7 +260,9 @@ class FuturesBroker:
                 q = self.ib.qualifyContracts(c)
                 if not q:
                     logging.warning("could not qualify %s %s — skipped", o.ib_symbol, o.expiry); continue
-                trade = self.ib.placeOrder(q[0], MarketOrder(o.action, o.qty))
+                order = MarketOrder(o.action, o.qty)
+                order.tif = "DAY"          # explicit — trims the preset TIF cancel/resubmit (Error 10349)
+                trade = self.ib.placeOrder(q[0], order)
                 self.ib.sleep(wait)
                 st = trade.orderStatus.status
                 fp = trade.orderStatus.avgFillPrice or None
