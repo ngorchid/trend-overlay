@@ -1,0 +1,5 @@
+numpy>=1.26
+pandas>=2.2
+yfinance>=0.2.40
+ib_insync>=0.9.86
+python-dotenv>=1.0
