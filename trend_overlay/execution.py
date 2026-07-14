@@ -21,7 +21,10 @@ from .contracts import FUTURES, FutureSpec
 class TrendPaperConfig:
     budget: float = 200_000.0          # $ risk capital allocated to the overlay
     target_vol: float = 0.10           # annualised portfolio vol target
-    lookbacks: tuple[int, ...] = (63, 126, 252)
+    # 6/12-month TSMOM. The 3-month (63d) leg was dropped 2026-07-14: it whipsaws in chop
+    # (standalone Sharpe 0.24, worst DD) and dragged the blend; (126,252) lifts backtest
+    # Sharpe 0.57->0.67 on its own and is the "variant D" config (with daily rebalance).
+    lookbacks: tuple[int, ...] = (126, 252)
     vol_window: int = 60
     use_micro: bool = True             # micros for sizing granularity
     overlay_multiple: float = 1.0      # scale the whole book (0.5x, 1.0x, ...)

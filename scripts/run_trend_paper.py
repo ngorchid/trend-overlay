@@ -1,16 +1,15 @@
-"""Trend-overlay paper runner — weekly trade, DAILY email.
+"""Trend-overlay paper runner — DAILY trade + DAILY email.
 
 Modes:
   python scripts/run_trend_paper.py --selftest      # offline roll/safety logic check
   python scripts/run_trend_paper.py                 # offline dry-run: print target book (no IB)
-  python scripts/run_trend_paper.py --live          # connect IB paper: read marks + email;
-                                                     #   on the weekly trade day also trade
-  python scripts/run_trend_paper.py --live --trade   # force the trade leg today
+  python scripts/run_trend_paper.py --live          # connect IB paper: trade + read marks + email
   python scripts/run_trend_paper.py --live --safety-only  # only run delivery safety-closes
 
-Design: connects every weekday to mark positions and send the daily P&L email; the trade
-leg (compute targets → safety → roll → reconcile) runs only on the weekly day (default Fri),
-so a daily cron gives a daily email and a weekly rebalance.
+Design: connects every weekday to compute targets → safety → roll → reconcile (DAILY rebalance,
+"variant D") and send the daily P&L email. Daily rebalancing tracks the slow (6/12-month) signal
+more tightly and reacts to reversals faster; because the signal is slow, turnover only rises
+modestly (~30->45x/yr) while backtest Sharpe improves vs the old weekly cadence.
 """
 from __future__ import annotations
 
@@ -40,7 +39,6 @@ from trend_overlay.state import TrendState  # noqa: E402
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
-TRADE_WEEKDAY = 4  # Friday
 
 
 def _selftest() -> None:
@@ -112,7 +110,8 @@ def main() -> None:
     today = now.strftime("%Y-%m-%d")
     if now.weekday() >= 5 and not args.force:
         logging.info("Weekend (%s) — skipping.", today); return
-    is_trade_day = args.trade or args.safety_only or now.weekday() == TRADE_WEEKDAY
+    # Variant D: rebalance every weekday (daily). --safety-only still restricts to the safety leg.
+    is_trade_day = not args.safety_only
 
     broker = FuturesBroker(port=args.port, client_id=args.client_id, dry_run=False)
     if not broker.connect():
