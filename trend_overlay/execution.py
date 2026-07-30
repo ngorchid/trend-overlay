@@ -233,7 +233,12 @@ class FuturesBroker:
         for p in self.ib.positions():
             c = p.contract
             if c.secType in ("FUT", "CONTFUT") and c.symbol in sym_to_mkt and p.position:
-                out.append(HeldPosition(sym_to_mkt[c.symbol], c.localSymbol or c.symbol,
+                # Store the ROOT symbol (e.g. "MHG"), NOT the localSymbol ("MHGU6"): execute()
+                # matches ib_symbol against spec roots and rebuilds the contract from
+                # (symbol, expiry). Using localSymbol made every close/roll/safety order fail
+                # its spec lookup and get silently skipped ("no spec for MHGU6 — skipped"),
+                # so old contracts never rolled out (over-target + broken delivery safety).
+                out.append(HeldPosition(sym_to_mkt[c.symbol], c.symbol,
                                         c.lastTradeDateOrContractMonth, p.position))
         return out
 
