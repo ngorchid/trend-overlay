@@ -50,6 +50,41 @@ class TrendPaperConfig:
                                        #   Do NOT tighten to 2.5: it buys no drawdown and takes
                                        #   skew -0.17 -> -0.26, and skew protection is the whole
                                        #   reason the vol-target is there.
+    # --- covariance vol-target (added 2026-08-08) --------------------------------------------
+    # The old estimator assumed markets were UNCORRELATED, so est_vol = sqrt(sum (w_i*vol_i)^2).
+    # But rates correlate with rates (ZN/ZB), FX with FX (6E/6A/6J), and in risk-off everything
+    # correlates — so it understated portfolio vol and the book ran 12-14% against a 10% target.
+    # Now est_vol = sqrt(w' Sigma w) with Sigma = D R D, D = diag(vol_used), R = sample
+    # correlation shrunk toward the identity by (1 - corr_weight).
+    # Backtested (live 10 basket, variant D, guards on): realised vol 13.9% -> 10.6%, Sharpe
+    # 0.61 -> 0.74, maxDD -32.5% -> -20.2%, skew -0.21 -> -0.09, with return UNCHANGED (+7.8%
+    # vs +7.6%). Monotone in corr_weight and holds in BOTH sub-periods, so not a fit.
+    # NB Sigma is only ever used as a QUADRATIC FORM (w'Sigma w) and never inverted, so
+    # estimation error matters far less here than it would in an optimiser — which is why the
+    # near-raw sample correlation beats heavy shrinkage, contrary to the usual intuition.
+    corr_window: int = 252             # correlations are more stable than vols -> longer window
+    corr_weight: float = 0.90          # weight on the sample correlation; rest -> identity
+    scale_clip: tuple[float, float] = (0.2, 1.5)   # bound the vol-target multiplier
+
+
+def _portfolio_vol(w: np.ndarray, vols: np.ndarray, rets: pd.DataFrame,
+                   cfg: TrendPaperConfig) -> float:
+    """Annualised book vol from the covariance: sqrt(w' Sigma w), Sigma = D R D.
+
+    Falls back to the independence assumption when there is not enough history to form a
+    correlation matrix (early in the sample, or if a market has just been added).
+    """
+    n = len(w)
+    indep = float(np.sqrt(np.nansum((w * vols) ** 2)))
+    if not cfg.corr_weight or len(rets) < cfg.corr_window:
+        return indep
+    R = rets.tail(cfg.corr_window).corr().values
+    if R.shape != (n, n) or not np.isfinite(R).all():
+        return indep
+    R = cfg.corr_weight * R + (1.0 - cfg.corr_weight) * np.eye(n)
+    D = np.diag(np.nan_to_num(vols))
+    var = float(w @ (D @ R @ D) @ w)
+    return float(np.sqrt(var)) if var > 0 else indep
 
 
 def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
@@ -94,12 +129,15 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
         rows.append((s.market, sg, vv_raw, expo, s.notional(cfg.use_micro), s.sym(cfg.use_micro)))
     df = pd.DataFrame(rows, columns=["market", "signal", "ann_vol", "dollar_exposure", "notional", "ib_symbol"]).set_index("market")
 
-    # aggregate vol-target (assume ~uncorrelated): scale so est. book vol ≈ target_vol.
-    # NB this is ~a no-op by construction once signals are +/-1 (vol cancels, see the config
-    # comment); it only bites when signals are fractional. The real protection is the guards.
-    per_mkt_vol = (df["dollar_exposure"] / cfg.budget) * df["ann_vol"]
-    est_vol = float(np.sqrt((per_mkt_vol ** 2).sum()))
-    scale = (cfg.target_vol / est_vol) if est_vol > 0 else 0.0
+    # aggregate vol-target: scale so estimated book vol ≈ target_vol, using the FULL covariance
+    # (see the config comment for why assuming independence understated vol by 20-30%).
+    w = (df["dollar_exposure"] / cfg.budget).values          # fraction of budget per market
+    sig_vec = v[[s.proxy_etf for s in specs]].values         # floored vols, aligned to df
+    est_vol = _portfolio_vol(w, sig_vec, rets[[s.proxy_etf for s in specs]], cfg)
+    lo, hi = cfg.scale_clip
+    scale = float(np.clip(cfg.target_vol / est_vol, lo, hi)) if est_vol > 0 else 0.0
+    logging.info("vol-target: est book vol %.2f%% -> scale %.2f (target %.1f%%)",
+                 100 * est_vol, scale, 100 * cfg.target_vol)
     df["dollar_exposure"] *= scale * cfg.overlay_multiple
 
     # GUARD 3 — gross notional backstop, applied AFTER the vol-target and overlay multiple.
