@@ -28,6 +28,28 @@ class TrendPaperConfig:
     vol_window: int = 60
     use_micro: bool = True             # micros for sizing granularity
     overlay_multiple: float = 1.0      # scale the whole book (0.5x, 1.0x, ...)
+    # --- exposure guards (added 2026-08-08) -------------------------------------------------
+    # Sizing is inverse-vol, so expo ~ 1/vol and notional EXPLODES as vol vanishes. The
+    # portfolio vol-target cannot catch it, because it is circular:
+    #     per_mkt_vol_i = (expo_i/budget)*vol_i = target_vol/sqrt(N)   <- vol_i CANCELS
+    #     est_vol = sqrt(sum per_mkt_vol^2) = target_vol, so scale = 1.0, a NO-OP.
+    # The model sizes with the same collapsed estimate it uses to MEASURE risk. Measured on the
+    # live 10-market basket: gross ran 2.8x budget at the median and hit 4.8x, and IEF at its
+    # 2.8% vol floor implies a $225k position on a $200k book — in ONE market. There was NO
+    # leverage cap here at all (the backtest's max_leverage=5.0 was never carried across).
+    # Three layered guards; each fixes something the others do not. Backtested in algo_trading
+    # scripts/trend_exposure_lab.py: worst-case gross 4.66x -> 3.00x and single-market 1.12x ->
+    # 0.40x, for 0.02 of Sharpe, with drawdown and skew both slightly BETTER.
+    vol_floor_pct: float = 0.20        # floor each market's vol at this percentile of its OWN
+                                       #   history (adaptive: IEF ~5.6% vs USO ~31% normal vol,
+                                       #   so an absolute floor cannot work). Also leans against
+                                       #   the estimate — vol at its 1st pct mean-reverts UP.
+    per_market_cap: float = 0.40       # max |notional| per market, as a fraction of budget.
+                                       #   The only guard that limits CONCENTRATION.
+    gross_cap: float = 3.0             # max total notional, as a multiple of budget. Backstop.
+                                       #   Do NOT tighten to 2.5: it buys no drawdown and takes
+                                       #   skew -0.17 -> -0.26, and skew protection is the whole
+                                       #   reason the vol-target is there.
 
 
 def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
@@ -43,22 +65,52 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
 
     signal = sum(np.sign(px / px.shift(lb) - 1.0) for lb in cfg.lookbacks) / len(cfg.lookbacks)
     vol = rets.rolling(cfg.vol_window).std() * np.sqrt(252)
-    sig, v = signal.iloc[-1], vol.iloc[-1]
+
+    # GUARD 1 — floor each market's vol at a percentile of its own trailing history. Expanding,
+    # so no lookahead. Falls back to the raw vol until there is enough history to form it.
+    vol_used = vol
+    if cfg.vol_floor_pct and cfg.vol_floor_pct > 0:
+        floor = vol.expanding(min_periods=252).quantile(cfg.vol_floor_pct)
+        vol_used = vol.where(floor.isna(), np.maximum(vol, floor))
+
+    sig, v_raw, v = signal.iloc[-1], vol.iloc[-1], vol_used.iloc[-1]
 
     N = len(specs)
     rows = []
     for s in specs:
-        sg, vv = float(sig[s.proxy_etf]), float(v[s.proxy_etf])
+        sg = float(sig[s.proxy_etf])
+        vv, vv_raw = float(v[s.proxy_etf]), float(v_raw[s.proxy_etf])
         # inverse-vol risk parity: each market ~ (budget*target_vol/sqrt(N)) of risk
         expo = 0.0 if (vv == 0 or vv != vv) else sg * (cfg.budget * cfg.target_vol / np.sqrt(N)) / vv
-        rows.append((s.market, sg, vv, expo, s.notional(cfg.use_micro), s.sym(cfg.use_micro)))
+        # GUARD 2 — cap any single market's notional. The gross cap alone does NOT stop one
+        # low-vol market dominating the book.
+        if cfg.per_market_cap and cfg.per_market_cap > 0:
+            lim = cfg.per_market_cap * cfg.budget
+            if abs(expo) > lim:
+                logging.info("cap %s: $%s -> $%s (%.0f%% of budget; vol %.1f%%)",
+                             s.market, f"{expo:,.0f}", f"{np.sign(expo)*lim:,.0f}",
+                             100 * cfg.per_market_cap, 100 * vv_raw)
+                expo = float(np.sign(expo) * lim)
+        rows.append((s.market, sg, vv_raw, expo, s.notional(cfg.use_micro), s.sym(cfg.use_micro)))
     df = pd.DataFrame(rows, columns=["market", "signal", "ann_vol", "dollar_exposure", "notional", "ib_symbol"]).set_index("market")
 
-    # aggregate vol-target (assume ~uncorrelated): scale so est. book vol ≈ target_vol
+    # aggregate vol-target (assume ~uncorrelated): scale so est. book vol ≈ target_vol.
+    # NB this is ~a no-op by construction once signals are +/-1 (vol cancels, see the config
+    # comment); it only bites when signals are fractional. The real protection is the guards.
     per_mkt_vol = (df["dollar_exposure"] / cfg.budget) * df["ann_vol"]
     est_vol = float(np.sqrt((per_mkt_vol ** 2).sum()))
     scale = (cfg.target_vol / est_vol) if est_vol > 0 else 0.0
     df["dollar_exposure"] *= scale * cfg.overlay_multiple
+
+    # GUARD 3 — gross notional backstop, applied AFTER the vol-target and overlay multiple.
+    if cfg.gross_cap and cfg.gross_cap > 0:
+        gross = float(df["dollar_exposure"].abs().sum())
+        lim = cfg.gross_cap * cfg.budget * cfg.overlay_multiple
+        if gross > lim:
+            logging.warning("gross cap: $%s -> $%s (%.1fx budget)",
+                            f"{gross:,.0f}", f"{lim:,.0f}", cfg.gross_cap)
+            df["dollar_exposure"] *= lim / gross
+
     df["contracts"] = (df["dollar_exposure"] / df["notional"]).round().astype(int)
     df["notional_used"] = df["contracts"] * df["notional"]
     return df
