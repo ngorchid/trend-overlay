@@ -63,7 +63,17 @@ class TrendPaperConfig:
     # estimation error matters far less here than it would in an optimiser — which is why the
     # near-raw sample correlation beats heavy shrinkage, contrary to the usual intuition.
     corr_window: int = 252             # correlations are more stable than vols -> longer window
-    corr_weight: float = 0.90          # weight on the sample correlation; rest -> identity
+    corr_weight: float = 0.90          # weight on the sample correlation; the rest goes to the
+                                       #   CONSTANT-CORRELATION target (every pair = the sample
+                                       #   mean), NOT the identity. Shrinking toward I would
+                                       #   shrink the off-diagonals toward zero, LOWERING
+                                       #   est_vol and RAISING leverage — anti-conservative when
+                                       #   correlations are mostly positive (mean |rho| ~0.35
+                                       #   here). Empirically it barely matters (Sharpe 0.72-0.74
+                                       #   across every target/weight tested); the big win was
+                                       #   going from independence to ANY correlation-aware
+                                       #   estimate. This just makes the shrinkage err the safe
+                                       #   way.
     scale_clip: tuple[float, float] = (0.2, 1.5)   # bound the vol-target multiplier
 
 
@@ -81,7 +91,10 @@ def _portfolio_vol(w: np.ndarray, vols: np.ndarray, rets: pd.DataFrame,
     R = rets.tail(cfg.corr_window).corr().values
     if R.shape != (n, n) or not np.isfinite(R).all():
         return indep
-    R = cfg.corr_weight * R + (1.0 - cfg.corr_weight) * np.eye(n)
+    off = ~np.eye(n, dtype=bool)
+    target = np.full((n, n), float(R[off].mean()))       # constant-correlation target
+    np.fill_diagonal(target, 1.0)
+    R = cfg.corr_weight * R + (1.0 - cfg.corr_weight) * target
     D = np.diag(np.nan_to_num(vols))
     var = float(w @ (D @ R @ D) @ w)
     return float(np.sqrt(var)) if var > 0 else indep
