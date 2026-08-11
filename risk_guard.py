@@ -474,3 +474,44 @@ def missed_runs(history, today: str, date_key: str = "date") -> tuple[int, str |
         return 0, last, ""
     return gap, last, (f"{gap} weekday run(s) MISSED since {last} — scheduler, machine or IB "
                        f"connection failed on those days")
+
+
+# ---------------------------------------------------------------- out-of-band alerting
+def push_alert(title: str, message: str, api_key: str | None = None) -> bool:
+    """Send a Pushbullet note. Returns True if it went out. NEVER raises.
+
+    WHY A SECOND CHANNEL: the daily email carries the alert records, but SMTP is a failure point
+    INSIDE the thing being monitored. If sending fails, `logging.error("Email failed")` fires —
+    and that alert would be delivered by the email that just failed. The alert channel cannot
+    report its own failure. Worse, if the box loses EMAIL_USER/EMAIL_PASS the sender logs a
+    warning and returns silently, so the system trades normally and tells you nothing, forever.
+    A push over HTTPS to a different host fails independently.
+
+    WHAT THIS IS NOT: a dead-man's switch. Push is initiated BY the run, so if the run never
+    executes nothing is sent and silence looks like a quiet day — exactly like email. Detecting
+    absence requires an EXTERNAL watcher holding its own schedule; no amount of pushing from
+    inside the process can do it.
+
+    Deliberately only called for WARNING+ — a daily "all fine" push is ignored within a week, and
+    an alert channel people ignore is not an alert channel.
+    """
+    key = api_key or os.getenv("PUSHBULLET_API_KEY")
+    if not key:
+        return False
+    try:
+        from pushbullet import Pushbullet
+        Pushbullet(key).push_note(title[:120], message[:1800])
+        return True
+    except Exception as e:  # noqa: BLE001 — monitoring must never break trading
+        logging.warning("push_alert failed: %s", e)
+        return False
+
+
+def push_if_alerts(collector, subject_prefix: str, api_key: str | None = None) -> bool:
+    """Push the collected alerts, if any. Call AFTER the email attempt, so an email failure is
+    itself included in what gets pushed."""
+    if collector is None or not getattr(collector, "records", None):
+        return False
+    lines = [f"[{lv}] {msg}" for lv, msg in collector.records]
+    return push_alert(f"{subject_prefix}: {collector.worst} x{len(collector.records)}",
+                      "\n".join(lines), api_key)

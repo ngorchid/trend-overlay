@@ -35,7 +35,7 @@ from trend_overlay.execution import (  # noqa: E402
     compute_targets, plan_roll_orders, safety_closes,
 )
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
-                        install_alert_collector, missed_runs)
+                        install_alert_collector, missed_runs, push_if_alerts)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -192,6 +192,7 @@ def main() -> None:
             logging.warning("heartbeat: %s", _note)
         send_report(state, positions, todays_orders, spy_day, spy_incep, today, dry_run=False,
                     alerts=ALERTS)
+        push_if_alerts(ALERTS, "Trend Overlay")
     finally:
         broker.disconnect()
     logging.info("Done %s: %d trades, %d open positions.", today, len(todays_orders), len(positions))
