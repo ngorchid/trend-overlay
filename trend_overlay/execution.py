@@ -16,6 +16,13 @@ import pandas as pd
 
 from .contracts import FUTURES, FutureSpec
 
+# risk_guard.py lives at the REPO ROOT, not in this package — one identical copy per repo, kept
+# in sync by hand. The runner puts ROOT on sys.path, so this resolves when invoked via scripts/.
+try:
+    from risk_guard import check_order
+except ImportError:  # guard unavailable -> execute() must still work, just unguarded
+    check_order = None
+
 
 @dataclass
 class TrendPaperConfig:
@@ -410,13 +417,24 @@ class FuturesBroker:
                                         c.lastTradeDateOrContractMonth, p.position))
         return out
 
-    def execute(self, orders: list[RollOrder], specs_by_market: dict, use_micro: bool, wait: float = 4.0) -> list[dict]:
+    def execute(self, orders: list[RollOrder], specs_by_market: dict, use_micro: bool,
+                wait: float = 4.0, limits=None) -> list[dict]:
         """Place a list of RollOrders, each on its specific (symbol, expiry) contract.
         Returns fills for state accounting:
             {market, symbol, expiry, action, qty, mult, fill_price, status, reason}
-        (fill_price None if not filled within `wait` — e.g. a queued/off-hours order)."""
+        (fill_price None if not filled within `wait` — e.g. a queued/off-hours order).
+
+        `limits` (a RiskLimits) enables the independent pre-trade guard. It re-derives each
+        order's notional from the budget rather than trusting compute_targets, because a guard
+        reusing the strategy's arithmetic cannot catch the strategy's own bug — and this file had
+        exactly such a bug (a per-market cap that was applied before a multiplier and so never
+        bound). SAFETY/delivery closes are exempt: blocking a forced close would leave a
+        physically-delivered contract to go to delivery, which is far worse than an oversized
+        position.
+        """
         from ib_insync import Future, MarketOrder
         fills: list[dict] = []
+        gross_seen = 0.0
         for o in orders:
             spec = next((s for s in specs_by_market.values()
                          if o.ib_symbol in (s.symbol, s.micro_symbol)), None)
@@ -424,6 +442,17 @@ class FuturesBroker:
             base = {"market": spec.market if spec else "?", "symbol": o.ib_symbol,
                     "expiry": o.expiry, "action": o.action, "qty": o.qty, "mult": mult,
                     "reason": o.reason}
+            if limits is not None and "SAFETY" not in (o.reason or "").upper():
+                notl = spec.notional(use_micro) if spec else 0.0
+                px = notl / mult if mult else 0.0
+                chk = check_order(o.ib_symbol, o.action, abs(o.qty), px, mult, limits,
+                                  gross_notional=gross_seen,
+                                  max_gross_frac=limits.max_gross_frac)
+                if not chk:
+                    logging.warning("RISK REJECT %s", chk.reason)
+                    fills.append({**base, "fill_price": None, "status": "RiskRejected"})
+                    continue
+                gross_seen += abs(o.qty) * notl
             if self.dry_run:
                 logging.info("[DRY RUN] %s %d %s %s  (%s)", o.action, o.qty, o.ib_symbol, o.expiry, o.reason)
                 fills.append({**base, "fill_price": None, "status": "dryrun"})

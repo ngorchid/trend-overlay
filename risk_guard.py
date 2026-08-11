@@ -278,3 +278,59 @@ def effective_budget(base: float, realized_pnl: float, unrealized_pnl: float = 0
         note += (f" [** DOWN {1-r:.0%} FROM BASE — this is a drawdown, not a sizing decision; "
                  f"consider halting **]")
     return base * r, note
+
+
+# ---------------------------------------------------------------- layer 3: circuit breaker
+@dataclass
+class BreakerLevels:
+    """Drawdown-from-peak thresholds. Set these BEYOND the strategy's expected drawdown.
+
+    This is the part people get wrong. The trend overlay's backtested maxDD is -20%, so a halt at
+    -20% would have fired at the historical worst point — capitulating at the bottom, converting a
+    recovered drawdown into a realised loss. That is the same mistake as the 2x stop we removed
+    from options-vrp.
+
+    A circuit breaker is an OPERATIONAL failsafe for "the model is broken, the data is wrong,
+    there is a bug" — NOT a risk-management tool for normal losses. Normal losses are handled by
+    SIZING. So the thresholds must sit outside the range the strategy is expected to produce, and
+    tripping one should be treated as evidence that something is wrong, not as bad luck.
+    """
+    derisk: float = 0.15        # halve exposure
+    reduce_only: float = 0.25   # no new risk; closing trades only
+    halt: float = 0.35          # stop entirely, manual restart
+
+
+def circuit_breaker(equity: float, peak_equity: float,
+                    levels: BreakerLevels | None = None) -> tuple[str, float, str]:
+    """(level, exposure_scale, reason). Levels: ok | derisk | reduce_only | halt.
+
+    `exposure_scale` multiplies target sizes; `reduce_only` and `halt` both return 0.0 but mean
+    different things to the caller — reduce_only still permits CLOSING trades, halt permits
+    nothing. The caller must honour that distinction, because a breaker that blocks closing
+    orders traps you in the position it is trying to protect you from.
+    """
+    lv = levels or BreakerLevels()
+    if not peak_equity or peak_equity <= 0 or equity != equity:
+        return "ok", 1.0, ""
+    dd = 1.0 - (equity / peak_equity)
+    if dd >= lv.halt:
+        return "halt", 0.0, (f"drawdown {dd:.1%} from peak ${peak_equity:,.0f} >= halt "
+                             f"{lv.halt:.0%} — STOPPED, manual restart required")
+    if dd >= lv.reduce_only:
+        return "reduce_only", 0.0, (f"drawdown {dd:.1%} >= {lv.reduce_only:.0%} — "
+                                    f"closing trades only, no new risk")
+    if dd >= lv.derisk:
+        return "derisk", 0.5, f"drawdown {dd:.1%} >= {lv.derisk:.0%} — exposure halved"
+    return "ok", 1.0, ""
+
+
+def peak_equity(history: list[dict], base: float, key: str = "total_pnl") -> float:
+    """Highest equity ever reached, from the strategy's own snapshot history.
+
+    Uses the strategy's OWN P&L series, not the account — same reason as `effective_budget`.
+    Falls back to `base` so a fresh book with no history cannot show a drawdown.
+    """
+    if not history:
+        return float(base)
+    vals = [float(base) + float(h.get(key, 0.0) or 0.0) for h in history]
+    return max([float(base)] + vals)

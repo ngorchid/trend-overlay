@@ -34,7 +34,7 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
-from risk_guard import effective_budget  # noqa: E402
+from risk_guard import RiskLimits, effective_budget  # noqa: E402
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -166,8 +166,9 @@ def main() -> None:
                 targets = {m: int(r["contracts"]) for m, r in tgt.iterrows()}
                 rolls = plan_roll_orders(targets, held_left, front, BY_MARKET, cfg.use_micro, today)
                 batches = [("SAFETY", safety), ("ROLL+RECONCILE", rolls)]
+            lim = RiskLimits.for_futures(cfg.budget)
             for label, batch in batches:
-                fills = broker.execute(batch, BY_MARKET, cfg.use_micro)
+                fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim)
                 for f in fills:
                     signed = f["qty"] if f["action"] == "BUY" else -f["qty"]
                     if f["fill_price"]:
