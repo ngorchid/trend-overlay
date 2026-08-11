@@ -72,11 +72,15 @@ def build_email_body(state: TrendState, positions: list[dict], todays_orders: li
 
 
 def send_report(state: TrendState, positions: list[dict], todays_orders: list[dict],
-                spy_day, spy_incep, today: str, dry_run: bool = False) -> str:
+                spy_day, spy_incep, today: str, dry_run: bool = False, alerts=None) -> str:
     body = build_email_body(state, positions, todays_orders, spy_day, spy_incep, today)
     unreal = sum(p.get("unrealized_pnl") or 0.0 for p in positions)
     total = state.realized_pnl + unreal
-    subject = f"Trend Overlay Paper — {today}: total P&L ${total:+,.0f} ({len(todays_orders)} trades)"
+    if alerts is not None and getattr(alerts, 'records', None):
+        body = alerts.html() + body
+    _mark = (f'[{alerts.worst} x{len(alerts.records)}] '
+             if alerts is not None and getattr(alerts, 'worst', None) else '')
+    subject = _mark + f"Trend Overlay Paper — {today}: total P&L ${total:+,.0f} ({len(todays_orders)} trades)"
     user, pw, to = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"), os.getenv("TO_EMAIL")
     if dry_run or not all([user, pw, to]):
         if not dry_run:

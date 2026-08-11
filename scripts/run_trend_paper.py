@@ -34,11 +34,15 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
-from risk_guard import RiskLimits, effective_budget  # noqa: E402
+from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
+                        install_alert_collector, missed_runs)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+# WARNING+ collected so the daily email can carry it — the scheduled task's stdout goes to a log
+# file nobody reads, so an unsurfaced guard rejection is indistinguishable from a clean run.
+ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
 
@@ -183,7 +187,11 @@ def main() -> None:
         spy_day, spy_incep, _ = _spy_returns(state.inception_date)
         state.record_snapshot(today, state.realized_pnl + unreal)
         state.save(STATE_FILE)
-        send_report(state, positions, todays_orders, spy_day, spy_incep, today, dry_run=False)
+        _m, _l, _note = missed_runs(state.nav_history, today)
+        if _note:
+            logging.warning("heartbeat: %s", _note)
+        send_report(state, positions, todays_orders, spy_day, spy_incep, today, dry_run=False,
+                    alerts=ALERTS)
     finally:
         broker.disconnect()
     logging.info("Done %s: %d trades, %d open positions.", today, len(todays_orders), len(positions))

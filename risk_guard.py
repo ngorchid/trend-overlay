@@ -437,3 +437,40 @@ def install_alert_collector(level: int = logging.WARNING) -> AlertCollector:
     h = AlertCollector(level)
     logging.getLogger().addHandler(h)
     return h
+
+
+# ---------------------------------------------------------------- heartbeat (retroactive)
+def missed_runs(history, today: str, date_key: str = "date") -> tuple[int, str | None, str]:
+    """(missed_weekdays, last_run_date, note) from the strategy's own snapshot history.
+
+    WHAT THIS CATCHES: the scheduler skipping days — a machine asleep, a failed IB connect, a
+    crash mid-run. On the next SUCCESSFUL run the email says so, instead of the gap passing
+    unnoticed because each individual email looked fine.
+
+    WHAT IT CANNOT CATCH, and this is the honest limit: a task that is dead for good. If the run
+    never executes there is no email to carry the warning, and silence is indistinguishable from a
+    quiet day. Closing that hole needs something OUTSIDE these systems — a dead-man's-switch
+    service pinged at the end of each run, which alerts when the ping stops. Until then, "no email
+    this evening" is the only signal and nothing watches for it.
+
+    Accepts list-of-dicts ({date: ...}) or list-of-tuples ((date, pnl)), since the three states
+    differ.
+    """
+    if not history:
+        return 0, None, ""
+    last = None
+    for h in history:
+        d = h.get(date_key) if isinstance(h, dict) else (h[0] if len(h) else None)
+        if d and (last is None or str(d) > last):
+            last = str(d)
+    if not last:
+        return 0, None, ""
+    try:
+        gap = len(pd.bdate_range(last, today)) - 2   # exclude both endpoints
+    except Exception:  # noqa: BLE001
+        return 0, last, ""
+    gap = max(int(gap), 0)
+    if gap <= 0:
+        return 0, last, ""
+    return gap, last, (f"{gap} weekday run(s) MISSED since {last} — scheduler, machine or IB "
+                       f"connection failed on those days")
