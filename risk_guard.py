@@ -236,3 +236,45 @@ def check_batch(orders: list[dict], limits: RiskLimits,
             reasons.append(c.reason)
             logging.warning("RISK REJECT: %s", c.reason)
     return accepted, reasons
+
+
+# ---------------------------------------------------------------- NAV-linked budget
+def effective_budget(base: float, realized_pnl: float, unrealized_pnl: float = 0.0,
+                     step: float = 0.10, max_grow: float = 3.0, warn_below: float = 0.70
+                     ) -> tuple[float, str]:
+    """Compound sizing off the strategy's OWN equity instead of a frozen env var.
+
+    WHY NOT IB's NetLiquidation: three strategies share one account. NetLiq is the WHOLE
+    account, so every strategy would size as if it owned all of it — a silent 3x over-allocation.
+    Each strategy must compound only its own realised + unrealised P&L.
+
+    WHY QUANTISED (`step`): a budget that moves every day makes every position target move every
+    day, which pushes contract targets back and forth across the whole-contract boundary — the
+    exact churn hysteresis exists to stop. Rounding equity to the nearest `step` (10% of base)
+    means the budget changes in discrete jumps a few times a year instead of daily. Stateless, so
+    there is nothing extra to persist or to get out of sync.
+
+    WHY THE CAP IS ONE-SIDED: `realized_pnl` is an accounting figure produced by our own code.
+    If it is ever wrong — a double-counted fill, a sign error, a corrupted state file — an
+    uncapped budget turns that bug directly into position size, so growth is capped at `max_grow`.
+    But there is deliberately NO FLOOR. An earlier version clipped both ways, which meant a real
+    95% loss still sized at 0.5x base: the floor rounds exposure UP, forcing you to trade capital
+    you no longer have. Letting the budget shrink freely is fail-safe in both readings — if the
+    loss is real you de-risk correctly, and if the ledger is broken you trade less, not more.
+    Deep losses should stop trading via the circuit breaker, not be papered over by a floor.
+
+    Returns (budget, note) — the note is for the daily log, so a change in size is never silent.
+    """
+    if not base or base <= 0 or base != base:
+        return 0.0, "invalid base budget"
+    equity = base + float(realized_pnl or 0.0) + float(unrealized_pnl or 0.0)
+    raw = equity / base
+    q = round(raw / step) * step if step and step > 0 else raw
+    r = float(max(min(q, max_grow), 0.0))          # cap growth; never floor the downside
+    note = f"equity ${equity:,.0f} = {raw:.2f}x base -> sizing at {r:.2f}x (${base*r:,.0f})"
+    if r < q:
+        note += f" [CAPPED at {max_grow:.1f}x — check the P&L ledger for a double-counted fill]"
+    if r <= warn_below:
+        note += (f" [** DOWN {1-r:.0%} FROM BASE — this is a drawdown, not a sizing decision; "
+                 f"consider halting **]")
+    return base * r, note

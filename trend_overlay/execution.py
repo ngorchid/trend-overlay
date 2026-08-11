@@ -75,6 +75,22 @@ class TrendPaperConfig:
                                        #   estimate. This just makes the shrinkage err the safe
                                        #   way.
     scale_clip: tuple[float, float] = (0.2, 1.5)   # bound the vol-target multiplier
+    # --- hysteresis on the contract count (added 2026-08-11) --------------------------------
+    # round() puts a knife-edge at exactly 0.5 contracts, so a market whose target sits near the
+    # boundary flips 0->1->0 on tiny changes in vol or signal, each flip a full-contract round
+    # trip. At $200k, rates_10y flipped 12.4x/yr at $112,000 a time = $1.39M of notional churned
+    # by noise. It does NOT shrink with budget, it MOVES: every budget parks some market on its
+    # own boundary. Hold n unless |target - n| >= band, then move to round(target); reversing
+    # then needs a 0.4-contract move rather than an arbitrarily small one.
+    # NB band 0.5 is EXACTLY today's behaviour (round() changes precisely when |target-n|>=0.5),
+    # which the lab uses as a null check and reproduces to the digit.
+    # Backtested contract-level in algo_trading/scripts/trend_hysteresis_lab.py, net of $0.85/ct
+    # + 1bp: Sharpe 0.655->0.801 at $100k and 0.619->0.715 at $200k, maxDD -18.8%->-15.0% and
+    # -26.4%->-25.1%. Chosen on SUB-PERIOD ROBUSTNESS, not on the full-sample peak: 0.7 beats
+    # the baseline in ALL FOUR cells (2 budgets x 2 halves) and sits mid-plateau (0.6/0.7/0.8 all
+    # survive), so it is not the argmax of any single cell. 0.9-1.0 look better in one cell and
+    # worse in another -- the classic fitted spike.
+    hysteresis_band: float = 0.70
 
 
 def _portfolio_vol(w: np.ndarray, vols: np.ndarray, rets: pd.DataFrame,
@@ -101,7 +117,8 @@ def _portfolio_vol(w: np.ndarray, vols: np.ndarray, rets: pd.DataFrame,
 
 
 def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
-                    specs: list[FutureSpec] = FUTURES) -> pd.DataFrame:
+                    specs: list[FutureSpec] = FUTURES,
+                    held: dict[str, int] | None = None) -> pd.DataFrame:
     """ETF-proxy price panel -> target signed contract counts per market.
 
     Returns a frame indexed by market with columns: signal, ann_vol, dollar_exposure,
@@ -153,6 +170,18 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
                  100 * est_vol, scale, 100 * cfg.target_vol)
     df["dollar_exposure"] *= scale * cfg.overlay_multiple
 
+    # GUARD 2b — RE-APPLY the per-market cap AFTER scaling. Guard 2 above runs before the
+    # vol-target multiplier, so any scale>1 silently undid it: measured 2026-08-11 with scale
+    # 1.16, "capped" markets sat at 46-49% of budget against a 40% cap, and scale_clip permits
+    # up to 1.5 (=60%). Capping only once, before a multiplier, is not a cap.
+    if cfg.per_market_cap and cfg.per_market_cap > 0:
+        lim2 = cfg.per_market_cap * cfg.budget * cfg.overlay_multiple
+        over = df["dollar_exposure"].abs() > lim2
+        if over.any():
+            logging.info("post-scale cap: %s -> %.0f%% of budget",
+                         ", ".join(df.index[over]), 100 * cfg.per_market_cap)
+            df.loc[over, "dollar_exposure"] = (np.sign(df.loc[over, "dollar_exposure"]) * lim2)
+
     # GUARD 3 — gross notional backstop, applied AFTER the vol-target and overlay multiple.
     if cfg.gross_cap and cfg.gross_cap > 0:
         gross = float(df["dollar_exposure"].abs().sum())
@@ -162,7 +191,43 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
                             f"{gross:,.0f}", f"{lim:,.0f}", cfg.gross_cap)
             df["dollar_exposure"] *= lim / gross
 
-    df["contracts"] = (df["dollar_exposure"] / df["notional"]).round().astype(int)
+    # GUARD 2c — the cap bounds TARGET DOLLARS, but the position we actually hold is a WHOLE
+    # number of contracts, and one contract can exceed the cap on its own. Measured 2026-08-11:
+    # rates_30y targeted -$71,910 against an $80,000 cap, yet one ZB is $115,000 = 57.5% of a
+    # $200k budget. Where a single contract breaches the cap, hold ZERO rather than blow through
+    # it -- the market is simply too chunky for this budget, which is a sizing fact, not a
+    # rounding preference.
+    # Hysteresis needs the CURRENT holding, so `held` (market -> signed contracts) must be
+    # passed in from the broker. Without it the band cannot apply and we fall back to round().
+    raw = df["dollar_exposure"] / df["notional"]
+    if cfg.hysteresis_band and cfg.hysteresis_band > 0 and held is not None:
+        band = float(cfg.hysteresis_band)
+        ct = []
+        for m, x in raw.items():
+            n = int(held.get(m, 0))
+            # A non-finite target means missing data, NOT a signal to flatten: HOLD. Writing
+            # this as `not isfinite(x) or ...` sends NaN into int(round(nan)), which raises.
+            if not np.isfinite(x):
+                ct.append(n)
+            else:
+                ct.append(int(np.round(x)) if abs(x - n) >= band else n)
+        df["contracts"] = pd.Series(ct, index=df.index).astype(int)
+    else:
+        df["contracts"] = raw.round().astype(int)
+    if cfg.per_market_cap and cfg.per_market_cap > 0:
+        lim3 = cfg.per_market_cap * cfg.budget * cfg.overlay_multiple
+        too_big = (df["contracts"].abs() * df["notional"]) > lim3 * 1.001
+        if too_big.any():
+            for m in df.index[too_big]:
+                n_ct = int(df.at[m, "contracts"])
+                held = abs(n_ct) * df.at[m, "notional"]
+                fits = int(np.floor(lim3 / df.at[m, "notional"]))
+                logging.warning("rounded position over cap: %s %dct = $%s > cap $%s -> %dct%s",
+                                m, n_ct, f"{held:,.0f}", f"{lim3:,.0f}", fits,
+                                "  (one contract alone exceeds the cap)" if fits == 0 else "")
+            df.loc[too_big, "contracts"] = ((np.sign(df.loc[too_big, "dollar_exposure"]) *
+                                             np.floor(lim3 / df.loc[too_big, "notional"]))
+                                            .astype(int))
     df["notional_used"] = df["contracts"] * df["notional"]
     return df
 

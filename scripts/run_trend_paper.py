@@ -34,6 +34,7 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
+from risk_guard import effective_budget  # noqa: E402
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -69,11 +70,30 @@ def _spy_returns(inception):
         return None, None, None
 
 
-def _cfg() -> TrendPaperConfig:
+def _cfg(state: TrendState | None = None, unrealized: float = 0.0) -> TrendPaperConfig:
+    """Build the config, sizing off the strategy's OWN compounded equity.
+
+    BUDGET is the BASE capital, not a fixed sizing number: the effective budget is
+    base + this strategy's realised + unrealised P&L, so markets come online by themselves as
+    the account grows and exposure shrinks after losses, with no manual edit and no restart.
+
+    Deliberately NOT IB's NetLiquidation — three strategies share one account, so NetLiq would
+    have each of them sizing as though it owned the whole thing.
+
+    NB OVERLAY_MULT defaults to 1.0. It was 0.5, which silently ran the book at HALF its
+    validated risk: the backtest (Sharpe 0.74, maxDD -20%) is at 1.0, so 0.5 realised ~5% vol
+    against a 10% target, for roughly half the expected return.
+    """
+    base = float(os.getenv("BUDGET", "100000"))
+    budget, note = base, ""
+    if state is not None:
+        budget, note = effective_budget(base, state.realized_pnl, unrealized,
+                                        step=float(os.getenv("BUDGET_STEP", "0.10")))
+        logging.info("budget: %s", note)
     return TrendPaperConfig(
-        budget=float(os.getenv("BUDGET", "100000")),
+        budget=budget,
         target_vol=float(os.getenv("TARGET_VOL", "0.10")),
-        overlay_multiple=float(os.getenv("OVERLAY_MULT", "0.5")))
+        overlay_multiple=float(os.getenv("OVERLAY_MULT", "1.0")))
 
 
 def _dry_book(cfg) -> None:
@@ -99,7 +119,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=int(os.getenv("IB_PORT", "7497")))
     ap.add_argument("--client-id", type=int, default=int(os.getenv("IB_CLIENT_ID", "6")))
     args = ap.parse_args()
-    cfg = _cfg()
+    # State is loaded here purely to size off compounded equity. Unrealised P&L needs live marks
+    # and the config is built before connecting, so this is REALISED-only for now — which lags
+    # gains and therefore UNDER-sizes after a run-up. Conservative, and the right way to be wrong.
+    cfg = _cfg(TrendState.load(STATE_FILE))
 
     if args.selftest:
         _selftest(); return
@@ -130,7 +153,16 @@ def main() -> None:
             else:
                 start = (pd.Timestamp.today() - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
                 px = download_ohlcv(PROXY_ETFS, start)["adj_close"]
-                tgt = compute_targets(px, cfg)
+                # Current holdings, so hysteresis can hold a position whose target sits inside
+                # the band. Keyed by MARKET (held_left is per contract-month); summed because a
+                # market can straddle two expiries mid-roll.
+                held_by_mkt: dict[str, int] = {}
+                for h in held_left:
+                    m = next((s_.market for s_ in FUTURES
+                              if s_.sym(cfg.use_micro) == h.ib_symbol), None)
+                    if m:
+                        held_by_mkt[m] = held_by_mkt.get(m, 0) + int(h.qty)
+                tgt = compute_targets(px, cfg, held=held_by_mkt)
                 targets = {m: int(r["contracts"]) for m, r in tgt.iterrows()}
                 rolls = plan_roll_orders(targets, held_left, front, BY_MARKET, cfg.use_micro, today)
                 batches = [("SAFETY", safety), ("ROLL+RECONCILE", rolls)]
