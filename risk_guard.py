@@ -388,3 +388,52 @@ def margin_check(margin_used: float, net_liq: float,
         return "no_new_risk", 0.0, (f"margin {used:.0%} of NAV >= {lim.max_new_risk:.0%} — "
                                     f"holding existing positions, no new ones")
     return "ok", 1.0, ""
+
+
+# ---------------------------------------------------------------- surfacing alerts
+class AlertCollector(logging.Handler):
+    """Collects WARNING+ records so the daily email can carry them.
+
+    WHY THIS EXISTS: every guard in this module logs its rejections, and on the Windows box the
+    scheduled task redirects stdout to `results\\paper\\run.log`. Nobody opens that file daily. So
+    a stale feed, a rejected order or a margin ceiling hit would sit in a log while the email
+    reported a perfectly normal-looking book — the exact silent failure the guards were written to
+    prevent. An alert that is not delivered is not an alert.
+
+    Attach once at startup; read `.records` when building the email, and put a marker in the
+    SUBJECT so it is visible without opening anything.
+    """
+
+    def __init__(self, level: int = logging.WARNING) -> None:
+        super().__init__(level)
+        self.records: list[tuple[str, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append((record.levelname, record.getMessage()))
+        except Exception:  # noqa: BLE001 — a broken alert must never break the run
+            pass
+
+    @property
+    def worst(self) -> str | None:
+        if any(lv in ("ERROR", "CRITICAL") for lv, _ in self.records):
+            return "ERROR"
+        return "WARN" if self.records else None
+
+    def html(self) -> str:
+        """Alert block for the top of the email; empty string when there is nothing to say."""
+        if not self.records:
+            return ""
+        rows = "".join(
+            f"<tr><td style='padding:2px 8px;color:#b00'><b>{lv}</b></td>"
+            f"<td style='padding:2px 8px'>{msg}</td></tr>" for lv, msg in self.records)
+        return ("<div style='border:2px solid #b00;padding:8px;margin:8px 0'>"
+                f"<b style='color:#b00'>{len(self.records)} ALERT(S) THIS RUN</b>"
+                f"<table style='font-family:monospace;font-size:12px'>{rows}</table></div>")
+
+
+def install_alert_collector(level: int = logging.WARNING) -> AlertCollector:
+    """Attach a collector to the root logger and return it."""
+    h = AlertCollector(level)
+    logging.getLogger().addHandler(h)
+    return h
