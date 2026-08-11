@@ -334,3 +334,57 @@ def peak_equity(history: list[dict], base: float, key: str = "total_pnl") -> flo
         return float(base)
     vals = [float(base) + float(h.get(key, 0.0) or 0.0) for h in history]
     return max([float(base)] + vals)
+
+
+# ---------------------------------------------------------------- shared-account margin ceiling
+@dataclass
+class MarginLimits:
+    """Margin-utilisation thresholds, as a fraction of net liquidation value.
+
+    THE RISK THIS ADDRESSES is specific to running several strategies in ONE IB account, which is
+    the right choice at small size: the trend overlay is a margin overlay on shared collateral
+    ($311,900 of notional against ~$10,900 of margin), so separating it into its own account would
+    require ~$27-33k of dedicated idle cash — unaffordable below roughly $250k of total capital.
+
+    The price of sharing is that the equity book must sit in a MARGIN account, where a severe
+    drawdown can force-liquidate stocks; and the collateral is CORRELATED with what it backs — in
+    a crash equities fall while futures margin requirements RISE, so headroom shrinks exactly when
+    the requirement grows. No code removes that. This ceiling just makes sure we notice early and
+    stop adding to it, rather than discovering it at the liquidation.
+
+    Same shape as the treasury system's MAX_MARGIN_FRAC=0.25, which is already proven in this book.
+    """
+    max_new_risk: float = 0.25   # above this, no NEW positions
+    derisk: float = 0.40         # above this, halve target exposure
+    halt: float = 0.60           # above this, closing trades only
+
+
+def margin_check(margin_used: float, net_liq: float,
+                 limits: MarginLimits | None = None) -> tuple[str, float, str]:
+    """(level, exposure_scale, reason). Levels: ok | no_new_risk | derisk | halt.
+
+    Note this is ACCOUNT-WIDE: in a shared account every strategy sees the total, so one strategy
+    can be blocked by another's usage. That is correct — the constraint really is account-wide,
+    and being blocked is strictly better than being liquidated.
+
+    As everywhere else here, `halt` must still permit CLOSING trades. A margin guard that blocks
+    the orders which would REDUCE margin is the worst possible failure mode.
+    """
+    lim = limits or MarginLimits()
+    if not net_liq or net_liq <= 0 or margin_used != margin_used:
+        # Distinct from "ok" ON PURPOSE: unknown must be visible in the log, not indistinguishable
+        # from healthy. Scale stays 1.0 (fail-OPEN) because the order and gross caps already bound
+        # notional, and therefore bound margin indirectly — and because blocking everything on a
+        # transient API gap would also block the contract ROLLS that prevent physical delivery.
+        # The caller may still choose to treat "unknown" as blocking.
+        return "unknown", 1.0, "MARGIN DATA UNAVAILABLE — ceiling not enforced this run"
+    used = margin_used / net_liq
+    if used >= lim.halt:
+        return "halt", 0.0, (f"margin {used:.0%} of NAV >= {lim.halt:.0%} — CLOSING TRADES ONLY; "
+                             f"liquidation risk")
+    if used >= lim.derisk:
+        return "derisk", 0.5, f"margin {used:.0%} of NAV >= {lim.derisk:.0%} — exposure halved"
+    if used >= lim.max_new_risk:
+        return "no_new_risk", 0.0, (f"margin {used:.0%} of NAV >= {lim.max_new_risk:.0%} — "
+                                    f"holding existing positions, no new ones")
+    return "ok", 1.0, ""
