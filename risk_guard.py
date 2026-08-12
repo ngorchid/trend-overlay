@@ -515,3 +515,42 @@ def push_if_alerts(collector, subject_prefix: str, api_key: str | None = None) -
     lines = [f"[{lv}] {msg}" for lv, msg in collector.records]
     return push_alert(f"{subject_prefix}: {collector.worst} x{len(collector.records)}",
                       "\n".join(lines), api_key)
+
+
+# ---------------------------------------------------------------- layer 4: reconciliation
+def reconcile(expected: dict[str, float], actual: dict[str, float], label: str = "",
+              tol: float = 1e-9) -> tuple[list[dict], str]:
+    """Compare what the strategy THINKS it holds against what the broker REPORTS.
+
+    Motivated by two real incidents (options-vrp, 2026-08-07..11): a close order left
+    PreSubmitted was booked as filled, so state dropped a spread that was still open at IB
+    (ORPHAN — a live position nothing manages); and a crash before `state.save()` meant two days
+    of broker activity were never persisted. Neither is visible from inside the strategy's own
+    records, because those records are exactly what is wrong.
+
+    Three discrepancy kinds, and they are not equally bad:
+      ORPHAN    at the broker, absent from state. WORST — nothing will manage, close or roll it.
+      PHANTOM   in state, absent at the broker. P&L and sizing are computed off a position that
+                does not exist.
+      MISMATCH  both sides hold it, different size.
+
+    ⚠ THE CALLER MUST FILTER `actual` TO THIS STRATEGY'S OWN INSTRUMENTS. Several strategies
+    share one IB account, so an unfiltered comparison reports the others' positions as orphans —
+    and acting on that is precisely the bug that once had one strategy flattening another's book.
+
+    REPORTS ONLY, never corrects. Auto-squaring a difference you do not understand can close a
+    real position or open an unintended one; the safe move is to alert and let a human look.
+    """
+    out: list[dict] = []
+    for k in sorted(set(expected) | set(actual)):
+        e, a = float(expected.get(k, 0.0)), float(actual.get(k, 0.0))
+        if abs(e - a) <= tol:
+            continue
+        kind = "ORPHAN" if abs(e) <= tol else ("PHANTOM" if abs(a) <= tol else "MISMATCH")
+        out.append({"key": k, "expected": e, "actual": a, "kind": kind})
+    if not out:
+        return out, ""
+    parts = [f"{d['kind']} {d['key']}: state {d['expected']:g} vs broker {d['actual']:g}"
+             for d in out]
+    return out, f"RECONCILE{' ' + label if label else ''} — {len(out)} discrepancy(ies): " + \
+                "; ".join(parts)

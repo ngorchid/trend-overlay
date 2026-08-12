@@ -35,7 +35,8 @@ from trend_overlay.execution import (  # noqa: E402
     compute_targets, plan_roll_orders, safety_closes,
 )
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
-                        install_alert_collector, missed_runs, push_if_alerts)
+                        install_alert_collector, missed_runs, push_if_alerts,
+                        reconcile)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -183,6 +184,14 @@ def main() -> None:
                         todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})
 
         positions = broker.portfolio_marks(FUTURES)
+        # RECONCILE the state LEDGER against IB. Positions themselves are re-read from IB every
+        # run, so they cannot drift — but the ledger drives REALISED-P&L accounting, and if it
+        # disagrees with the broker the P&L is wrong in a way nothing else surfaces. Report only.
+        _exp = {m: float(l.qty) for m, l in state.ledger.items() if l.qty}
+        _act = {p["market"]: float(p["contracts"]) for p in positions}
+        _d, _rnote = reconcile(_exp, _act, label="futures ledger")
+        if _rnote:
+            logging.warning("%s", _rnote)
         unreal = sum(p.get("unrealized_pnl") or 0.0 for p in positions)
         spy_day, spy_incep, _ = _spy_returns(state.inception_date)
         state.record_snapshot(today, state.realized_pnl + unreal)
