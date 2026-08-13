@@ -38,7 +38,8 @@ from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
-                        data_fresh, write_equity, book_drawdown, BookLevels)
+                        data_fresh, write_equity, book_drawdown, BookLevels,
+                        BreakerLevels, realised_vol)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -185,7 +186,10 @@ def main() -> None:
         _eq = _base + state.realized_pnl + _unreal
         _peak = max(peak_equity(state.nav_history, _base, key="total_pnl"), _eq)
         write_equity(ROOT.parent, "trend-overlay", _eq, _peak)
-        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak)
+        # Vol-scaled: 15/25/35 IS 1.2/2.0/2.8 sigma at trend's ~12.4% vol, so this leaves the
+        # levels ~unchanged here while fixing the higher-vol equity book.
+        _lv = BreakerLevels.from_vol(realised_vol(state.nav_history, _base, key="total_pnl"))
+        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak, _lv)
         if _bwhy:
             (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
         # BOOK-level: three books each down 20% all sit under their own 25% threshold while the

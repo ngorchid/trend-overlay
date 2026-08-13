@@ -338,6 +338,55 @@ class BreakerLevels:
     reduce_only: float = 0.25   # no new risk; closing trades only
     halt: float = 0.35          # stop entirely, manual restart
 
+    # In SIGMAS of the strategy's own annual vol. The defaults above ARE these multiples at
+    # trend's 12.4% vol -- which is the whole problem with using them everywhere.
+    SIGMAS = (1.2, 2.0, 2.8)
+
+    @classmethod
+    def from_vol(cls, ann_vol: float | None, sigmas: tuple = SIGMAS,
+                 lo: float = 0.10, hi: float = 0.70) -> "BreakerLevels":
+        """Levels scaled to the strategy's OWN volatility.
+
+        ⚠ A FIXED PERCENTAGE MEANS DIFFERENT THINGS AT DIFFERENT VOLATILITIES, and using one set
+        everywhere was measurably harmful. Backtested 2026-08-13: at 12.4% vol (trend) 15/25/35
+        is 1.2σ/2.0σ/2.8σ and costs 0.01 Sharpe. At 21.6% vol (the enhanced magic formula) the
+        same percentages are 0.7σ/1.2σ/1.6σ — routine moves, not failures — and cost **0.34
+        Sharpe and 7.5%/yr**, with the capitulation test showing 13 of 13 triggers followed by a
+        POSITIVE 63 days averaging +9%. It fired at the bottom every single time.
+
+        Vol-scaled, trend keeps 15/25/35 and magic-formula becomes 26/43/61; both then cost ~0.
+        Bounds guard against a degenerate vol estimate turning the breaker into a hair trigger
+        (lo) or disabling it entirely (hi).
+        """
+        if not ann_vol or ann_vol != ann_vol or ann_vol <= 0:
+            return cls()                      # no estimate -> the documented defaults
+        d, r, h = (float(np.clip(m * ann_vol, lo, hi)) for m in sigmas)
+        return cls(derisk=d, reduce_only=max(r, d + 0.01), halt=max(h, r + 0.01))
+
+
+def realised_vol(history, base: float, key: str = "total_pnl", absolute: bool = False,
+                 min_obs: int = 60) -> float | None:
+    """Annualised vol of the strategy's OWN equity curve, or None if too little history.
+
+    None on purpose: with a handful of observations the estimate is noise, and scaling the
+    breaker off noise is worse than using the documented defaults.
+    """
+    if not history or len(history) < min_obs:
+        return None
+    vals = []
+    for h in history:
+        v = h.get(key) if isinstance(h, dict) else (h[1] if len(h) > 1 else None)
+        if v is None or v != v:
+            continue
+        vals.append(float(v) if absolute else float(base) + float(v))
+    if len(vals) < min_obs:
+        return None
+    eq = pd.Series(vals, dtype=float)
+    r = eq.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < min_obs - 1 or r.std() == 0:
+        return None
+    return float(r.std() * np.sqrt(252))
+
 
 def circuit_breaker(equity: float, peak_equity: float,
                     levels: BreakerLevels | None = None) -> tuple[str, float, str]:
