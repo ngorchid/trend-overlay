@@ -86,21 +86,48 @@ class RiskLimits:
 
 
 # ---------------------------------------------------------------- kill switch
+HALT_NONE, HALT_NEW, HALT_ALL = "none", "new_risk", "all"
+
+
+def halt_state(root: Path | str) -> tuple[str, str]:
+    """(mode, reason). Modes: none | new_risk | all.
+
+    TWO FILES, deliberately, because "stop trading" has two meanings and conflating them is
+    dangerous:
+
+      HALT      -> NEW_RISK. Open nothing new; keep MANAGING what is already on — profit targets,
+                   time stops, rolls and delivery closes all still run. This is the one you want
+                   almost always: "something looks wrong, stop adding until I have looked."
+      HALT_ALL  -> ALL. The run exits immediately having done nothing.
+                   ⚠ THIS ALSO BLOCKS DELIVERY CLOSES. A physically-delivered contract (ZB, ZN,
+                   SIL) left past its notice date goes to DELIVERY. Only use it when you can watch
+                   the account, and clear it before any notice date.
+
+    A FILE rather than an env var so it can be dropped in from a phone via a synced folder,
+    without touching the scheduler, the code, or a remote session. Whatever text the file contains
+    is echoed into the alert, so leave yourself a note about why.
+    """
+    r = Path(root)
+    for name, mode in ((r / "HALT_ALL", HALT_ALL), (r / "HALT", HALT_NEW)):
+        if name.exists():
+            note = ""
+            try:
+                note = name.read_text().strip()[:200]
+            except OSError:
+                pass
+            return mode, f"{name.name} present" + (f": {note}" if note else "")
+    env = os.getenv("TRADING_HALT", "").strip().lower()
+    if env in ("all", "2"):
+        return HALT_ALL, "TRADING_HALT=all"
+    if env in ("1", "true", "yes", "new", "new_risk"):
+        return HALT_NEW, f"TRADING_HALT={env}"
+    return HALT_NONE, ""
+
+
 def halted(root: Path | str, limits: RiskLimits | None = None) -> Check:
-    """Is the manual kill switch engaged? A file, not an env var, so it can be dropped in over
-    SSH/RDP or a synced folder without touching the scheduler or the code."""
-    name = limits.halt_file if limits else "HALT"
-    f = Path(root) / name
-    if f.exists():
-        note = ""
-        try:
-            note = f.read_text().strip()[:200]
-        except OSError:
-            pass
-        return Check(False, f"HALT file present at {f}" + (f": {note}" if note else ""))
-    if os.getenv("TRADING_HALT", "").lower() in ("1", "true", "yes"):
-        return Check(False, "TRADING_HALT env var set")
-    return PASS
+    """Back-compat wrapper: False (not ok) when ANY halt is in force."""
+    mode, why = halt_state(root)
+    return PASS if mode == HALT_NONE else Check(False, why)
 
 
 # ---------------------------------------------------------------- layer 1: data

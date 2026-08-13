@@ -36,7 +36,7 @@ from trend_overlay.execution import (  # noqa: E402
 )
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
-                        reconcile)
+                        reconcile, halt_state, HALT_ALL, HALT_NEW)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -129,6 +129,16 @@ def main() -> None:
     # gains and therefore UNDER-sizes after a run-up. Conservative, and the right way to be wrong.
     cfg = _cfg(TrendState.load(STATE_FILE))
 
+    # KILL SWITCH. HALT_ALL exits before connecting; HALT freezes exposure but still ROLLS —
+    # a physically-delivered contract (ZB, ZN, SIL) left past its notice date goes to DELIVERY,
+    # so a halt that blocks rolls is more dangerous than the situation prompting it.
+    _halt, _hwhy = halt_state(ROOT)
+    if _halt == HALT_ALL:
+        logging.error("HALTED (all): %s — exiting without trading. NOTE: delivery/roll safety "
+                      "closes did NOT run.", _hwhy)
+        push_if_alerts(ALERTS, "Trend Overlay")
+        return
+
     if args.selftest:
         _selftest(); return
     if not args.live:
@@ -169,6 +179,13 @@ def main() -> None:
                         held_by_mkt[m] = held_by_mkt.get(m, 0) + int(h.qty)
                 tgt = compute_targets(px, cfg, held=held_by_mkt)
                 targets = {m: int(r["contracts"]) for m, r in tgt.iterrows()}
+                if _halt == HALT_NEW:
+                    # Freeze exposure at what is already held: plan_roll_orders will still roll
+                    # out of near-expiry contracts into the front month at the SAME size, so
+                    # nothing drifts toward delivery, but no position is opened, closed or
+                    # resized. SAFETY closes are untouched and run regardless.
+                    logging.warning("HALTED (new risk): holding current exposure, rolls only")
+                    targets = dict(held_by_mkt)
                 rolls = plan_roll_orders(targets, held_left, front, BY_MARKET, cfg.use_micro, today)
                 batches = [("SAFETY", safety), ("ROLL+RECONCILE", rolls)]
             lim = RiskLimits.for_futures(cfg.budget)
