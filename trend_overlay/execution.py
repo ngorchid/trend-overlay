@@ -378,7 +378,11 @@ class FuturesBroker:
         if key in self._front:
             return self._front[key]
         from ib_insync import Future
-        base = Future(symbol=key, exchange=spec.exchange, currency=spec.currency)
+        # Pass the multiplier so an ambiguous symbol resolves to the right contract: silver's
+        # 1,000oz micro shares the "SI" symbol with the 5,000oz full, distinguished ONLY by
+        # multiplier. Harmless for uniquely-symboled markets (their one multiplier matches).
+        base = Future(symbol=key, exchange=spec.exchange, currency=spec.currency,
+                      multiplier=str(int(spec.mult(use_micro))))
         try:
             details = self.ib.reqContractDetails(base)
             cutoff = pd.Timestamp.today() + pd.Timedelta(days=spec.notice_buffer_days)
@@ -483,7 +487,8 @@ class FuturesBroker:
             if spec is None:
                 logging.warning("no spec for %s — skipped", o.ib_symbol); continue
             c = Future(symbol=o.ib_symbol, lastTradeDateOrContractMonth=o.expiry,
-                       exchange=spec.exchange, currency=spec.currency)
+                       exchange=spec.exchange, currency=spec.currency,
+                       multiplier=str(int(mult)))   # disambiguates silver's SI micro vs full (see front_future)
             try:
                 q = self.ib.qualifyContracts(c)
                 if not q:
