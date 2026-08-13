@@ -418,7 +418,7 @@ class FuturesBroker:
         return out
 
     def execute(self, orders: list[RollOrder], specs_by_market: dict, use_micro: bool,
-                wait: float = 4.0, limits=None) -> list[dict]:
+                wait: float = 20.0, limits=None) -> list[dict]:
         """Place a list of RollOrders, each on its specific (symbol, expiry) contract.
         Returns fills for state accounting:
             {market, symbol, expiry, action, qty, mult, fill_price, status, reason}
@@ -468,7 +468,15 @@ class FuturesBroker:
                 order = MarketOrder(o.action, o.qty)
                 order.tif = "DAY"          # explicit — trims the preset TIF cancel/resubmit (Error 10349)
                 trade = self.ib.placeOrder(q[0], order)
-                self.ib.sleep(wait)
+                # Poll up to `wait`s, returning as soon as the order reaches a terminal state. A
+                # single fixed sleep read the status while still PreSubmitted, so the email showed
+                # unfilled orders that had actually filled a second later. Liquid names return in ~1s.
+                waited = 0.0
+                while waited < wait:
+                    self.ib.sleep(1.0)
+                    waited += 1.0
+                    if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive", "Rejected"):
+                        break
                 st = trade.orderStatus.status
                 fp = trade.orderStatus.avgFillPrice or None
                 logging.info("%s %d %s %s -> %s%s  (%s)", o.action, o.qty, o.ib_symbol, o.expiry,
