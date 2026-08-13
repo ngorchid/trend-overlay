@@ -37,7 +37,8 @@ from trend_overlay.execution import (  # noqa: E402
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity, margin_check, MarginLimits)
+                        circuit_breaker, peak_equity, margin_check, MarginLimits,
+                        data_fresh)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -198,11 +199,23 @@ def main() -> None:
             safety = safety_closes(held, BY_MARKET, today)
             done = {(o.ib_symbol, o.expiry) for o in safety}
             held_left = [h for h in held if (h.ib_symbol, h.expiry) not in done]
-            if args.safety_only:
+            # Target leg needs FRESH prices; SAFETY closes never do and must always run,
+            # or a physically-delivered contract drifts toward delivery.
+            _fresh = None
+            if not args.safety_only:
+                start_dt = (pd.Timestamp.today() - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
+                px = download_ohlcv(PROXY_ETFS, start_dt)["adj_close"]
+                # A frozen feed still yields a signal, a vol estimate and a full target book —
+                # all plausible, all wrong. price sanity cannot catch it: each price is valid,
+                # just old.
+                _fresh = data_fresh(px.index, pd.Timestamp(today),
+                                    RiskLimits.for_futures(cfg.budget))
+                if not _fresh:
+                    logging.error("data staleness: %s — SAFETY closes only today", _fresh.reason)
+
+            if args.safety_only or not _fresh:
                 batches = [("SAFETY", safety)]
             else:
-                start = (pd.Timestamp.today() - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
-                px = download_ohlcv(PROXY_ETFS, start)["adj_close"]
                 # Current holdings, so hysteresis can hold a position whose target sits inside
                 # the band. Keyed by MARKET (held_left is per contract-month); summed because a
                 # market can straddle two expiries mid-roll.
