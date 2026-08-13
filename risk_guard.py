@@ -54,7 +54,12 @@ class RiskLimits:
     price_collar: float = 0.10         # limit price must sit within this of the reference mark
     max_daily_move: float = 0.35       # |spot / prior close - 1| above this = suspect feed
     max_data_age_days: int = 4         # calendar days; 4 covers a long holiday weekend
-    min_iv: float = 0.03               # options only: below this the chain is junk, not calm
+    # 5%, not 3%. Measured on the off-hours chain of 2026-08-11: most names returned a constant
+    # 1.56% but XOM and SBUX returned 3.13% -- the junk values are quantised, and a 3% floor let
+    # the 3.13% ones through. A REAL 36-day ATM IV below 5% does not occur for these underlyings
+    # (SPY's calmest ever is ~6-7%, TLT ~7%, single names rarely under 10%), so 5% cannot bind on
+    # good data while catching the whole junk cluster.
+    min_iv: float = 0.05               # options only: below this the chain is junk, not calm
     max_iv: float = 3.00
     halt_file: str = "HALT"            # presence of this file stops all trading
 
