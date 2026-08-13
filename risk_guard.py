@@ -43,6 +43,21 @@ class Check:
 PASS = Check(True)
 
 
+def _num(x) -> float | None:
+    """Coerce to a finite float, or None. Never raises.
+
+    Every numeric guard takes values that ultimately come from a JSON state file or a broker
+    response, so a NaN, a None or a string can arrive without warning. A guard that raises on one
+    kills the run it exists to protect -- which is strictly worse than the risk it was watching
+    for. Returning None lets each guard decide what "no information" means for it.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
 @dataclass
 class RiskLimits:
     """Hard bounds, as fractions of budget unless stated. Deliberately loose — these are meant to
@@ -248,6 +263,13 @@ def check_batch(orders: list[dict], limits: RiskLimits,
                 max_gross_frac: float | None = None) -> tuple[list[dict], list[str]]:
     """Validate a day's orders together, accumulating gross as it goes.
 
+    ⚠ NOT WIRED ANYWHERE (audited 2026-08-13). The batch property it provides is already achieved
+    in every strategy by passing a RUNNING `gross_notional` into per-order `check_order` calls:
+    magic-formula passes `state.positions_value_usd(...)`, trend accumulates `gross_seen` inside
+    `execute()`, options-vrp passes the summed max-loss of open spreads. Kept because it is
+    tested and is the cleaner API if a caller ever has the full day's orders up front — but do
+    not assume it is protecting anything today.
+
     Order-by-order checks cannot catch a batch that is individually fine and collectively absurd —
     thirty orders at 10% of budget each pass singly and blow the book together.
 
@@ -298,9 +320,18 @@ def effective_budget(base: float, realized_pnl: float, unrealized_pnl: float = 0
 
     Returns (budget, note) — the note is for the daily log, so a change in size is never silent.
     """
-    if not base or base <= 0 or base != base:
+    b = _num(base)
+    if not b or b <= 0:
         return 0.0, "invalid base budget"
-    equity = base + float(realized_pnl or 0.0) + float(unrealized_pnl or 0.0)
+    base = b
+    # A NaN anywhere in the P&L ledger must NOT propagate: `round(nan)` raises, and this runs at
+    # CONFIG time, so it would kill the run before any guard, order or email. One bad fill price
+    # coerced into realized_pnl would poison state.json permanently.
+    rp, up = _num(realized_pnl), _num(unrealized_pnl)
+    if rp is None or up is None:
+        return base, (f"P&L not finite (realised={realized_pnl!r}, unrealised={unrealized_pnl!r})"
+                      f" -- sizing at BASE ${base:,.0f}; CHECK THE LEDGER")
+    equity = base + rp + up
     raw = equity / base
     q = round(raw / step) * step if step and step > 0 else raw
     r = float(max(min(q, max_grow), 0.0))          # cap growth; never floor the downside
@@ -427,9 +458,10 @@ def circuit_breaker(equity: float, peak_equity: float,
     orders traps you in the position it is trying to protect you from.
     """
     lv = levels or BreakerLevels()
-    if not peak_equity or peak_equity <= 0 or equity != equity:
+    eq, pk = _num(equity), _num(peak_equity)
+    if eq is None or pk is None or pk <= 0:
         return "ok", 1.0, ""
-    dd = 1.0 - (equity / peak_equity)
+    dd = 1.0 - (eq / pk)
     if dd >= lv.halt:
         return "halt", 0.0, (f"drawdown {dd:.1%} from peak ${peak_equity:,.0f} >= halt "
                              f"{lv.halt:.0%} — STOPPED, manual restart required")
@@ -503,14 +535,15 @@ def margin_check(margin_used: float, net_liq: float,
     the orders which would REDUCE margin is the worst possible failure mode.
     """
     lim = limits or MarginLimits()
-    if not net_liq or net_liq <= 0 or margin_used != margin_used:
+    mu, nl = _num(margin_used), _num(net_liq)
+    if mu is None or nl is None or nl <= 0:
         # Distinct from "ok" ON PURPOSE: unknown must be visible in the log, not indistinguishable
         # from healthy. Scale stays 1.0 (fail-OPEN) because the order and gross caps already bound
         # notional, and therefore bound margin indirectly — and because blocking everything on a
         # transient API gap would also block the contract ROLLS that prevent physical delivery.
         # The caller may still choose to treat "unknown" as blocking.
         return "unknown", 1.0, "MARGIN DATA UNAVAILABLE — ceiling not enforced this run"
-    used = margin_used / net_liq
+    used = mu / nl
     if used >= lim.halt:
         return "halt", 0.0, (f"margin {used:.0%} of NAV >= {lim.halt:.0%} — CLOSING TRADES ONLY; "
                              f"liquidation risk")
