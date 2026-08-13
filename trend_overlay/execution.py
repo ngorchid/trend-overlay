@@ -344,6 +344,29 @@ class FuturesBroker:
             logging.error("IB connect failed: %s", e)
             return False
 
+    def margin_usage(self) -> tuple[float, float] | None:
+        """(maintenance margin used, net liquidation) for the WHOLE account, or None.
+
+        Account-wide on purpose: three strategies share this account, so the margin constraint
+        genuinely is shared and one strategy can legitimately be blocked by another's usage.
+        Being blocked beats being liquidated. MaintMarginReq rather than FullInitMarginReq
+        because maintenance is what an actual liquidation is measured against.
+
+        Returns None on any failure, so the caller reports "unknown" rather than assuming healthy.
+        """
+        if self.dry_run or self.ib is None:
+            return None
+        try:
+            rows = {r.tag: r for r in self.ib.accountSummary()}
+            mm = rows.get("MaintMarginReq") or rows.get("FullMaintMarginReq")
+            nl = rows.get("NetLiquidation")
+            if not mm or not nl:
+                return None
+            return float(mm.value), float(nl.value)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("margin_usage failed: %s", e)
+            return None
+
     def disconnect(self):
         if self.ib and self.ib.isConnected():
             self.ib.disconnect()

@@ -37,7 +37,7 @@ from trend_overlay.execution import (  # noqa: E402
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity)
+                        circuit_breaker, peak_equity, margin_check, MarginLimits)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -176,6 +176,22 @@ def main() -> None:
     state = TrendState.load(STATE_FILE); state.ensure_inception(today)
     todays_orders: list[dict] = []
     try:
+        # MARGIN CEILING — needs a live connection, so it sits here rather than at config time.
+        # This is the strategy that actually CONSUMES the shared margin: the overlay runs
+        # $311,900 of notional against ~$10,900 of margin, collateralised by the equity book.
+        # The reading is ACCOUNT-WIDE, so trend can be blocked by another strategy's usage —
+        # correct, since the constraint really is shared.
+        _mu = broker.margin_usage()
+        _mlvl, _mscale, _mwhy = margin_check(*(_mu if _mu else (float("nan"), 0.0)),
+                                             limits=MarginLimits())
+        if _mwhy:
+            (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
+                "margin: %s", _mwhy)
+        if _mscale <= 0 and _mlvl != "unknown":
+            _halt = HALT_NEW            # freeze exposure; rolls + safety closes still run
+        elif 0 < _mscale < 1.0:
+            cfg.overlay_multiple *= _mscale
+
         if is_trade_day:
             front = broker.front_expiries(FUTURES, cfg.use_micro)
             held = broker.held_positions(FUTURES)
