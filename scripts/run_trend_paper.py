@@ -39,7 +39,7 @@ from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
                         data_fresh, write_equity, book_drawdown, BookLevels,
-                        BreakerLevels, realised_vol)
+                        BreakerLevels, blended_vol)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -48,6 +48,14 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 # file nobody reads, so an unsurfaced guard rejection is indistinguishable from a clean run.
 ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
+
+# Annualised vol prior for the circuit-breaker levels, from the contract-level backtest
+# (algo_trading/scripts/breaker_calibration_lab.py, live config at OVERLAY_MULT 1.0): 12.4%.
+# ⚠ THIS IS THE POST-CHANGE FIGURE. OVERLAY_MULT went 0.5 -> 1.0 on 2026-08-13, doubling
+# exposure and so vol; the recorded nav_history still describes the HALF-SIZED book and would
+# understate it for months. Update this prior whenever OVERLAY_MULT, TARGET_VOL or the market
+# set changes.
+VOL_PRIOR = 0.124
 
 
 def _selftest() -> None:
@@ -188,7 +196,8 @@ def main() -> None:
         write_equity(ROOT.parent, "trend-overlay", _eq, _peak)
         # Vol-scaled: 15/25/35 IS 1.2/2.0/2.8 sigma at trend's ~12.4% vol, so this leaves the
         # levels ~unchanged here while fixing the higher-vol equity book.
-        _lv = BreakerLevels.from_vol(realised_vol(state.nav_history, _base, key="total_pnl"))
+        _lv = BreakerLevels.from_vol(blended_vol(state.nav_history, _base, VOL_PRIOR,
+                                                 key="total_pnl"))
         _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak, _lv)
         if _bwhy:
             (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)

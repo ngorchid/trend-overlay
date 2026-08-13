@@ -364,6 +364,35 @@ class BreakerLevels:
         return cls(derisk=d, reduce_only=max(r, d + 0.01), halt=max(h, r + 0.01))
 
 
+def blended_vol(history, base: float, prior: float, key: str = "total_pnl",
+                absolute: bool = False, prior_obs: int = 250) -> float:
+    """Live realised vol shrunk toward a BACKTEST PRIOR by how much history exists.
+
+    TWO PROBLEMS THIS SOLVES, both live rather than theoretical:
+
+    COLD START. Below the min_obs cut, `realised_vol` returns None and the breaker fell back to
+    the generic 15/25/35 — which was measured as HARMFUL on a 21.6%-vol equity book (−0.34
+    Sharpe, fired at the bottom 13 of 13 times). A new book would therefore run its first ~3
+    months on precisely the thresholds we know are wrong for it, which is the window you are
+    watching most closely.
+
+    STRUCTURAL CHANGE. The trend overlay's OVERLAY_MULT went 0.5 -> 1.0 on 2026-08-13, doubling
+    its exposure and so its vol. Its recorded history still describes the half-sized book, so a
+    pure live estimate understates the new vol and sets the thresholds too tight until the
+    history turns over. **When a config change materially alters a strategy's risk, UPDATE ITS
+    PRIOR — the history will not tell you for months.**
+
+    Shrinkage weight n/(n+prior_obs): at 60 observations the prior carries ~80%, at 250 half, at
+    1000 about a fifth. No cliff at the min_obs boundary.
+    """
+    live = realised_vol(history, base, key=key, absolute=absolute, min_obs=20)
+    if live is None or not prior or prior <= 0:
+        return float(live if live is not None else (prior or 0.0))
+    n = len([h for h in history]) if history else 0
+    w = n / (n + float(prior_obs))
+    return float(w * live + (1.0 - w) * prior)
+
+
 def realised_vol(history, base: float, key: str = "total_pnl", absolute: bool = False,
                  min_obs: int = 60) -> float | None:
     """Annualised vol of the strategy's OWN equity curve, or None if too little history.
