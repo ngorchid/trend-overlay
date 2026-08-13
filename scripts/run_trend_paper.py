@@ -269,6 +269,11 @@ def main() -> None:
                     else:
                         todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})
 
+        # Let IB's portfolio/position feed catch up with THIS run's fills before we read it. The
+        # feed lags a fill by a second or two, so reading immediately can show a just-traded
+        # contract at its PRE-trade size and report a FALSE orphan/phantom in the reconcile
+        # (fx_aud, 2026-08-13: sold 3 M6A, ledger already 0, feed still showed 3).
+        broker.ib.sleep(3)
         positions = broker.portfolio_marks(FUTURES)
         # RECONCILE the state LEDGER against IB. Positions themselves are re-read from IB every
         # run, so they cannot drift — but the ledger drives REALISED-P&L accounting, and if it

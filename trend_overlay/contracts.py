@@ -58,7 +58,7 @@ FUTURES: list[FutureSpec] = [
     # (and ZB has NO micro at ~$115k/contract, so it needs a larger budget than the micros).
     FutureSpec("rates_30y", "TLT", "ZB", "CBOT",  "USD", 1000,   115_000, notice_buffer_days=25),                 # phys. delivered; no micro
     FutureSpec("silver",    "SLV", "SI", "COMEX", "USD", 5000,   175_000, "SIL", 1000,    35_000, notice_buffer_days=30),  # SIL = 1,000oz micro, phys. delivered
-    FutureSpec("fx_jpy",    "FXY", "6J", "CME",   "USD", 12500000, 82_000, "M6J", 1250000, 8_200, notice_buffer_days=10),   # M6J = 1/10 micro
+    FutureSpec("fx_jpy",    "FXY", "6J", "CME",   "USD", 12500000, 82_000, "MJY", 1250000, 8_200, notice_buffer_days=10),   # MJY = 1/10 micro (IB symbol; "M6J" does not resolve — Error 200)
 ]
 
 BY_MARKET: dict[str, FutureSpec] = {s.market: s for s in FUTURES}
