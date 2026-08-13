@@ -356,15 +356,30 @@ def circuit_breaker(equity: float, peak_equity: float,
     return "ok", 1.0, ""
 
 
-def peak_equity(history: list[dict], base: float, key: str = "total_pnl") -> float:
+def peak_equity(history, base: float, key: str = "total_pnl",
+                absolute: bool = False) -> float:
     """Highest equity ever reached, from the strategy's own snapshot history.
 
-    Uses the strategy's OWN P&L series, not the account — same reason as `effective_budget`.
-    Falls back to `base` so a fresh book with no history cannot show a drawdown.
+    ⚠ THE THREE STATES STORE DIFFERENT THINGS, and getting this wrong silently invents a
+    drawdown or hides one:
+        magic-formula  {"date","nav"}        -> ABSOLUTE NAV        -> absolute=True
+        trend-overlay  {"date","total_pnl"}  -> P&L delta vs base   -> absolute=False
+        options-vrp    (date, total_pnl)     -> P&L delta, a TUPLE  -> absolute=False
+
+    With `absolute=False` the value is added to `base`; with True it is the equity itself.
+    Accepts dicts or tuples. Falls back to `base`, so a fresh book cannot show a drawdown.
+
+    Uses the strategy's OWN series, never the account — same reason as `effective_budget`:
+    three strategies share one IB account.
     """
     if not history:
         return float(base)
-    vals = [float(base) + float(h.get(key, 0.0) or 0.0) for h in history]
+    vals = []
+    for h in history:
+        v = h.get(key) if isinstance(h, dict) else (h[1] if len(h) > 1 else None)
+        if v is None or v != v:
+            continue
+        vals.append(float(v) if absolute else float(base) + float(v))
     return max([float(base)] + vals)
 
 
