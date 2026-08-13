@@ -38,7 +38,7 @@ from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, margin_check, MarginLimits,
-                        data_fresh)
+                        data_fresh, write_equity, book_drawdown, BookLevels)
 from trend_overlay.state import TrendState  # noqa: E402
 
 load_dotenv(ROOT / ".env")
@@ -141,24 +141,6 @@ def main() -> None:
         push_if_alerts(ALERTS, "Trend Overlay")
         return
 
-    # CIRCUIT BREAKER on the overlay's own equity (base + realised P&L; unrealised needs live
-    # marks and the config is built before connecting, so this LAGS and therefore under-reacts —
-    # conservative in the right direction). Thresholds sit outside the expected range: the
-    # backtested maxDD is -20%, so a halt AT -20% would fire at the historical worst point.
-    # derisk halves exposure via overlay_multiple; reduce_only/halt freeze it — targets are set
-    # to current holdings later, so rolls continue and nothing drifts toward delivery. It never
-    # auto-flattens.
-    _st = TrendState.load(STATE_FILE)
-    _base = float(os.getenv("BUDGET", "100000"))
-    _peak = peak_equity(_st.nav_history, _base, key="total_pnl")
-    _blvl, _bscale, _bwhy = circuit_breaker(_base + _st.realized_pnl, _peak)
-    if _bwhy:
-        (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
-    if _bscale <= 0:
-        _halt = HALT_NEW                    # freeze exposure; rolls + safety closes continue
-    elif _bscale < 1.0:
-        cfg.overlay_multiple *= _bscale
-
     if args.selftest:
         _selftest(); return
     if not args.live:
@@ -192,6 +174,32 @@ def main() -> None:
             _halt = HALT_NEW            # freeze exposure; rolls + safety closes still run
         elif 0 < _mscale < 1.0:
             cfg.overlay_multiple *= _mscale
+
+        # CIRCUIT BREAKER — here, not at config time, so it can see UNREALISED P&L. Realised-only
+        # is blind to exactly the drawdowns that matter: a futures book held for months can be
+        # deep underwater with nothing booked. An extra portfolio read is cheap and idempotent;
+        # the later read at reporting time reflects POST-trade state and must stay separate.
+        _pre = broker.portfolio_marks(FUTURES)
+        _unreal = sum(p.get("unrealized_pnl") or 0.0 for p in _pre)
+        _base = float(os.getenv("BUDGET", "100000"))
+        _eq = _base + state.realized_pnl + _unreal
+        _peak = max(peak_equity(state.nav_history, _base, key="total_pnl"), _eq)
+        write_equity(ROOT.parent, "trend-overlay", _eq, _peak)
+        _blvl, _bscale, _bwhy = circuit_breaker(_eq, _peak)
+        if _bwhy:
+            (logging.error if _blvl == "halt" else logging.warning)("circuit breaker: %s", _bwhy)
+        # BOOK-level: three books each down 20% all sit under their own 25% threshold while the
+        # total is down 20%. Takes the WORSE of own and book.
+        _bdd, _beq, _bpk, _bnote = book_drawdown(ROOT.parent)
+        if _bdd is not None:
+            _lvl2, _sc2, _why2 = circuit_breaker(_beq, _bpk, BookLevels())
+            if _why2:
+                logging.warning("BOOK circuit breaker: %s | %s", _why2, _bnote)
+            _bscale = min(_bscale, _sc2)
+        if _bscale <= 0:
+            _halt = HALT_NEW            # freeze exposure; rolls + safety closes continue
+        elif _bscale < 1.0:
+            cfg.overlay_multiple *= _bscale
 
         if is_trade_day:
             front = broker.front_expiries(FUTURES, cfg.use_micro)

@@ -21,6 +21,7 @@ something is wrong.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -324,8 +325,14 @@ class BreakerLevels:
 
     A circuit breaker is an OPERATIONAL failsafe for "the model is broken, the data is wrong,
     there is a bug" — NOT a risk-management tool for normal losses. Normal losses are handled by
-    SIZING. So the thresholds must sit outside the range the strategy is expected to produce, and
-    tripping one should be treated as evidence that something is wrong, not as bad luck.
+    SIZING.
+
+    ⚠ HONEST CALIBRATION NOTE. Only `reduce_only` and `halt` sit beyond the expected range;
+    trend's backtested maxDD is −20%, so `derisk` at 15% WOULD have fired during the historical
+    worst drawdown. That is deliberate for a soft, recoverable response (halve exposure), but it
+    means derisk is a NORMAL-OPERATION response, not a failsafe. Do not read all three levels the
+    same way. These three numbers are JUDGMENT CALLS, unlike the hysteresis band (backtested,
+    sub-period robust) or min_iv (bracketed by observed junk vs historical minimum IV).
     """
     derisk: float = 0.15        # halve exposure
     reduce_only: float = 0.25   # no new risk; closing trades only
@@ -601,3 +608,91 @@ def reconcile(expected: dict[str, float], actual: dict[str, float], label: str =
              for d in out]
     return out, f"RECONCILE{' ' + label if label else ''} — {len(out)} discrepancy(ies): " + \
                 "; ".join(parts)
+
+
+# ---------------------------------------------------------------- book-level equity
+@dataclass
+class BookLevels(BreakerLevels):
+    """TIGHTER than the per-strategy levels, and that is the whole point.
+
+    ⚠ A book drawdown computed as 1 - sum(equity)/sum(peak) is a peak-WEIGHTED AVERAGE of the
+    individual drawdowns, so it can never exceed the worst strategy. With the SAME thresholds a
+    book breaker is mathematically incapable of firing when no strategy fires — it adds nothing.
+    It only earns its place with tighter levels, which is defensible on its own terms: the book is
+    diversified, so a given drawdown there means more than the same number in one sleeve.
+    """
+    derisk: float = 0.10
+    reduce_only: float = 0.18
+    halt: float = 0.25
+
+
+def write_equity(root: Path | str, strategy: str, equity: float, peak: float) -> None:
+    """Publish this strategy's equity, and append the BOOK TOTAL to a running history.
+
+    Each strategy's own breaker sees only its own slice, so a correlated bleed across all three
+    is invisible to every one of them individually.
+
+    ⚠ THE HISTORY MATTERS: peak-of-the-total is NOT the sum of individual peaks. Those highs
+    occur at DIFFERENT times, so summing them invents a book peak that never existed and inflates
+    every subsequent drawdown. Appending the total each run and taking its running max measures
+    the book's actual equity curve. Still approximate — the three runs fire at different times of
+    day — but it is the right quantity rather than a systematically biased one.
+
+    Best-effort: never raises. Failing to publish must not stop trading.
+    """
+    try:
+        f = Path(root) / "book_equity.json"
+        d = json.loads(f.read_text()) if f.exists() else {}
+        cur = d.get("strategies", {})
+        cur[strategy] = {"equity": float(equity), "peak": float(peak),
+                         "ts": pd.Timestamp.utcnow().isoformat()}
+        d["strategies"] = cur
+        total = sum(float(v["equity"]) for v in cur.values())
+        hist = d.get("book_history", [])
+        today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+        hist = [h for h in hist if h.get("date") != today]
+        hist.append({"date": today, "total": total})
+        d["book_history"] = hist[-500:]
+        f.write_text(json.dumps(d, indent=2))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("write_equity failed: %s", e)
+
+
+def book_drawdown(root: Path | str, max_age_days: int = 5
+                  ) -> tuple[float | None, float, float, str]:
+    """(drawdown, total_equity, book_peak, note) from the book's OWN equity curve.
+
+    Peak is the running max of the recorded TOTAL, not the sum of individual peaks — see
+    `write_equity`. Stale strategies are dropped from the current total: one that stopped running
+    would otherwise freeze its last equity in, understating the drawdown exactly when it matters.
+    """
+    try:
+        f = Path(root) / "book_equity.json"
+        if not f.exists():
+            return None, 0.0, 0.0, ""
+        d = json.loads(f.read_text())
+    except Exception as e:  # noqa: BLE001
+        return None, 0.0, 0.0, f"book_equity unreadable: {e}"
+    now = pd.Timestamp.utcnow()
+    eq = 0.0
+    used, stale = [], []
+    for name, v in (d.get("strategies") or {}).items():
+        try:
+            age = (now - pd.Timestamp(v["ts"])).days
+        except Exception:  # noqa: BLE001
+            age = 999
+        if age > max_age_days:
+            stale.append(f"{name}({age}d)")
+            continue
+        eq += float(v["equity"])
+        used.append(name)
+    hist = [float(h["total"]) for h in (d.get("book_history") or []) if "total" in h]
+    peak = max(hist + [eq]) if (hist or eq) else 0.0
+    if not used or peak <= 0:
+        return None, 0.0, 0.0, ("book drawdown: no fresh entries" +
+                                (f"; stale: {', '.join(stale)}" if stale else ""))
+    dd = 1.0 - eq / peak
+    note = f"book across {len(used)} ({', '.join(used)}): ${eq:,.0f} vs curve peak ${peak:,.0f}"
+    if stale:
+        note += f"  [IGNORED stale: {', '.join(stale)}]"
+    return dd, eq, peak, note
