@@ -37,7 +37,13 @@ class Check:
     reason: str = ""
 
     def __bool__(self) -> bool:
-        return self.ok
+        # bool() of the raw value, because Python REQUIRES __bool__ to return a real bool and
+        # raises TypeError on a numpy.bool_. Guard conditions are routinely numpy comparisons
+        # (np.isfinite, a Series test, an ndarray element), so without this coercion a guard
+        # built from one would raise at its own `if not check:` site — killing the run it exists
+        # to protect, which is strictly worse than the risk it was watching for. Found 2026-08-14
+        # while writing the sizing suite.
+        return bool(self.ok)
 
 
 PASS = Check(True)
