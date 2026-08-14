@@ -34,7 +34,8 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
-from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
+from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+                        check_allocations,
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, liquidity_check, MarginLimits,
@@ -100,10 +101,23 @@ def _cfg(state: TrendState | None = None, unrealized: float = 0.0) -> TrendPaper
     validated risk: the backtest (Sharpe 0.74, maxDD -20%) is at 1.0, so 0.5 realised ~5% vol
     against a 10% target, for roughly half the expected return.
     """
-    base = float(os.getenv("BUDGET", "100000"))
-    budget, note = base, ""
-    if state is not None:
-        budget, note = effective_budget(base, state.realized_pnl, unrealized,
+    # This sleeve's SHARE of the live account, from the validated table in
+    # risk_guard.ALLOCATIONS. The old hard-coded $100,000 sat alongside magic-formula's $50k and
+    # options-vrp's $75k -- three independently-set budgets on one $50k account, summing to 74%
+    # of NAV in maintenance. Peak margin here is ~3.5% SPAN on ~3.12x budget of notional.
+    # BUDGET in .env still overrides for a deliberate one-off.
+    _alloc_ok = check_allocations()
+    if not _alloc_ok:
+        logging.error("ALLOCATION: %s", _alloc_ok.reason)
+    _override = os.getenv("BUDGET")
+    if _override:
+        budget = float(_override)
+        logging.info("budget: $%s from BUDGET override — allocation table BYPASSED",
+                     f"{budget:,.0f}")
+    else:
+        budget, note = allocated_budget("trend-overlay",
+                                        getattr(state, "last_net_liq", 0.0) or None,
+                                        float(os.getenv("NOMINAL_NAV", str(NOMINAL_NAV))),
                                         step=float(os.getenv("BUDGET_STEP", "0.10")))
         logging.info("budget: %s", note)
     return TrendPaperConfig(
@@ -176,6 +190,10 @@ def main() -> None:
         _mu = broker.margin_cushion()
         _mlvl, _mscale, _mwhy = liquidity_check(*(_mu if _mu else (float("nan"), 0.0)),
                                                 limits=MarginLimits())
+        # Same call already returns NetLiq; store it so the NEXT run sizes off the real account
+        # rather than the nominal anchor.
+        if _mu and _mu[1] and _mu[1] > 0:
+            state.last_net_liq = float(_mu[1])
         if _mwhy:
             (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
                 "margin: %s", _mwhy)

@@ -25,6 +25,11 @@ class TrendState:
     ledger: dict[str, MarketLedger] = field(default_factory=dict)
     trade_log: list[dict] = field(default_factory=list)
     nav_history: list[dict] = field(default_factory=list)   # [{date, total_pnl, spy}]
+    # Account-wide NetLiquidation as of the LAST run. The budget is a fraction of it, but the
+    # config is built before the broker connects, so it is read from here and refreshed after.
+    # One day stale is immaterial: the budget is quantised to 10% steps. 0.0 = never seen, and
+    # `allocated_budget` then falls back to the nominal share and says so in the log.
+    last_net_liq: float = 0.0
 
     # ---- persistence ----
     @classmethod

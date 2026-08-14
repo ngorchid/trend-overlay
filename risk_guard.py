@@ -506,6 +506,122 @@ def peak_equity(history, base: float, key: str = "total_pnl",
     return max([float(base)] + vals)
 
 
+# ---------------------------------------------------- shared-account capital allocation
+@dataclass(frozen=True)
+class Allocation:
+    """One strategy's sizing base, as a FRACTION of account NetLiquidation.
+
+    `peak_margin_coef` is that strategy's WORST-CASE maintenance margin expressed as a fraction
+    of its OWN budget. These are structural, not estimates:
+
+      magic-formula  0.25   Reg-T maintenance on long stock is 25% of position value, and
+                            `_gross_scalar` is clipped to <=1 so gross never exceeds 1.0x budget.
+      options-vrp    0.18   max_positions (6) x risk_per_trade (3%). A defined-risk spread's
+                            margin IS its max loss, so this is a hard ceiling, not a typical case.
+      trend-overlay  0.109  ~3.5% SPAN on ~3.12x budget of notional ($311,900 against ~$10,900).
+
+    Multiply coef by fraction to get each sleeve's peak margin as a share of NAV; the sum is what
+    the account must carry simultaneously.
+    """
+    fraction: float
+    peak_margin_coef: float
+    note: str = ""
+
+
+# WHY THIS EXISTS. Until 2026-08-14 each strategy sized off its OWN independently-configured
+# budget -- magic-formula off its own NAV, trend off BUDGET=100000, options-vrp off
+# BASE_BUDGET=75000 -- with no strategy aware of any other. Those three numbers summed to $225k of
+# sizing base on a $50k account and would have put total maintenance at 74% of NAV, tripping
+# `no_new_risk` on an ordinary day. Nothing in the system could see that, because the only shared
+# mechanism is a BACKSTOP that blocks, not an allocator that reserves.
+#
+# ⚠ REG-T DOES NOT NET THESE. Long-stock maintenance and a short put spread's max loss ADD; they
+# do not offset even though one arguably hedges the other. Futures sit in a separate SPAN segment.
+# Cross-margining requires Portfolio Margin ($110k minimum at IB), so below that the sum is simply
+# additive and this table is the real constraint, not a conservative one.
+#
+# Fractions of 1.0 are deliberate and are NOT "3x over-allocation": the strategies share
+# COLLATERAL rather than carving up cash, so what must be bounded is the summed MARGIN (53.9% of
+# NAV here), not the summed budget. `effective_budget`'s docstring warns against sizing off
+# NetLiq precisely because it was unallocated; making the fraction explicit and validating the
+# margin sum is the principled version of the same idea.
+# ⚠ SCOPE: these THREE sleeves only. Any other strategy trading the same IB account draws on the
+# same collateral without appearing here, so the cushion below is an upper bound on what is
+# actually free. Add it to this table before relying on the number.
+ALLOCATIONS: dict[str, Allocation] = {
+    "magic-formula": Allocation(1.00, 0.25, "Reg-T 25% of gross; gross <= 1.0x budget"),
+    "trend-overlay": Allocation(1.00, 0.109, "~3.5% SPAN on ~3.12x budget notional"),
+    "options-vrp": Allocation(1.00, 0.18, "max_positions 6 x risk_per_trade 3% -- structural"),
+}
+MIN_ALLOCATION_CUSHION = 0.40
+
+# Quantisation anchor for `allocated_budget` — the account's nominal size, NOT a cap. Budgets are
+# `fraction x NetLiq` rounded to 10% steps of `fraction x NOMINAL_NAV`, so this only sets where the
+# steps fall. It does bound growth at `max_grow` (3x) as a guard against a corrupted P&L ledger,
+# so RAISE IT once the account is durably past ~2x, or budgets will silently stop tracking NetLiq.
+NOMINAL_NAV = 50_000.0
+
+
+def allocation_cushion(allocations: dict[str, Allocation] | None = None) -> float:
+    """Fraction of NAV left free once every strategy is at its PEAK margin simultaneously."""
+    a = allocations if allocations is not None else ALLOCATIONS
+    return 1.0 - sum(x.fraction * x.peak_margin_coef for x in a.values())
+
+
+def check_allocations(allocations: dict[str, Allocation] | None = None,
+                      min_cushion: float = MIN_ALLOCATION_CUSHION) -> Check:
+    """Do the configured fractions leave enough room when everything is at peak at once?
+
+    Deliberately checked against SIMULTANEOUS peaks. The three sleeves are not independent —
+    options-vrp runs +0.23 tail-conditional to magic-formula, and in a crash equities fall while
+    futures margin requirements RISE — so the cushion is thinnest exactly when all three want
+    capital. Assuming the peaks are staggered is the assumption that fails when it matters.
+    """
+    a = allocations if allocations is not None else ALLOCATIONS
+    for name, x in a.items():
+        if not (0.0 <= x.fraction) or not (0.0 <= x.peak_margin_coef):
+            return Check(False, f"{name}: negative fraction/coefficient")
+    c = allocation_cushion(a)
+    if c < min_cushion:
+        worst = ", ".join(f"{n} {x.fraction * x.peak_margin_coef:.1%}" for n, x in a.items())
+        return Check(False, f"allocations leave only {c:.1%} cushion at simultaneous peak "
+                            f"(floor {min_cushion:.0%}) — {worst}")
+    return PASS
+
+
+def allocated_budget(strategy: str, net_liq: float | None, nominal_nav: float,
+                     allocations: dict[str, Allocation] | None = None,
+                     step: float = 0.10, max_grow: float = 3.0) -> tuple[float, str]:
+    """(budget, note) — this strategy's sizing base as its share of the LIVE account.
+
+    Replaces a hand-set per-strategy BUDGET. Because the fractions live in one table whose margin
+    sum is validated, the sleeves can no longer be resized independently into a combination that
+    does not fit; and each scales with the account automatically, so options-vrp reaches its
+    measured $75-100k plateau as NAV grows without anyone editing a file.
+
+    Quantised through `effective_budget` (the anchor being `fraction x nominal_nav`, the growth
+    term `fraction x (net_liq - nominal_nav)`), so this inherits its step, its one-sided growth
+    cap and its no-floor-on-losses behaviour rather than reimplementing them. It does NOT compound
+    on the strategy's own realised P&L: NetLiq already contains it, and adding it again would
+    double-count.
+
+    `net_liq` unavailable -> falls back to the nominal share and says so, rather than sizing off
+    a number it does not have.
+    """
+    a = allocations if allocations is not None else ALLOCATIONS
+    alloc = a.get(strategy)
+    if alloc is None:
+        return 0.0, f"no allocation configured for {strategy!r} — refusing to size"
+    base = alloc.fraction * float(nominal_nav)
+    nl = _num(net_liq)
+    if nl is None or nl <= 0:
+        return base, (f"NETLIQ UNAVAILABLE — sizing at the nominal share "
+                      f"{alloc.fraction:.0%} x ${nominal_nav:,.0f} = ${base:,.0f}")
+    budget, note = effective_budget(base, alloc.fraction * (nl - float(nominal_nav)),
+                                    step=step, max_grow=max_grow)
+    return budget, f"{alloc.fraction:.0%} of NetLiq ${nl:,.0f}: {note}"
+
+
 # ------------------------------------------------------- shared-account liquidity floor
 @dataclass
 class MarginLimits:

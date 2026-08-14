@@ -41,6 +41,10 @@ python scripts\run_trend_paper.py --live --trade       # force a live trade + em
 ## Schedule
 A **daily** run gives a daily email; the trade leg only fires on the weekly day (Friday).
 
+⚠ 18:00 CET is load-bearing, not arbitrary: margin in the shared IB account is claimed
+FIRST-COME-FIRST-SERVED, so run order IS the priority order. It must stay between
+magic-formula (16:30) and options-vrp (21:30) — Sharpe 0.96 > 0.74 > 0.52.
+
 ```bat
 schtasks /Create /TN "TrendOverlayPaper" ^
   /TR "C:\trading\trend-overlay\scripts\run_trend_paper.py --live" ^

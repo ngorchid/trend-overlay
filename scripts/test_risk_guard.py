@@ -15,14 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from risk_guard import (RiskLimits, chain_sane, check_batch, check_order,  # noqa: E402
-                        data_fresh, halted, liquidity_check, price_sane, Check)
+                        data_fresh, halted, liquidity_check, price_sane, Check,
+                        ALLOCATIONS, Allocation, MIN_ALLOCATION_CUSHION,
+                        allocated_budget, allocation_cushion, check_allocations)
 
 L = RiskLimits(budget=100_000.0)
 TODAY = pd.Timestamp("2026-08-11")
 fails, ran = [], 0
 
 
-def expect(label: str, got, want_ok: bool) -> None:
+def expect(label: str, got, want_ok: bool = True) -> None:
     """`got` MUST be a Check (or anything defining __bool__).
 
     A plain ad-hoc object is ALWAYS truthy, so `expect(..., True)` on one can never
@@ -154,6 +156,90 @@ for lab, a, b in [("nan", float("nan"), NAV), ("None", None, NAV), ("zero NAV", 
     expect(f"liquidity {lab} -> unknown, fail-open",
            Check(l_ == "unknown" and s_ == 1.0, f"got {l_}/{s_}"), True)
 
+
+# ---------------------------------------------------------------- capital allocation
+# Added 2026-08-14. Before this, each strategy sized off its OWN independently-set budget with no
+# strategy aware of any other: $50k + $75k + $100k of sizing base on a $50k account, which put
+# total maintenance at 74% of NAV and tripped no_new_risk on an ordinary day. The only shared
+# mechanism was a backstop that BLOCKS, not an allocator that RESERVES.
+print("\n--- capital allocation (fraction of NetLiq, validated against simultaneous peak) ---")
+
+_c = allocation_cushion()
+print(f"  configured cushion at simultaneous peak: {_c:.1%} (floor {MIN_ALLOCATION_CUSHION:.0%})")
+for _n, _a in ALLOCATIONS.items():
+    print(f"    {_n:16} {_a.fraction:>5.0%} of NetLiq x {_a.peak_margin_coef:.3f} peak "
+          f"= {_a.fraction*_a.peak_margin_coef:>6.1%} of NAV")
+expect("shipped allocations leave >= the required cushion", check_allocations())
+expect("cushion matches 1 - sum(fraction x coef)",
+       Check(abs(_c - (1 - sum(a.fraction*a.peak_margin_coef for a in ALLOCATIONS.values())))
+             < 1e-12, f"{_c}"))
+
+# The combination the capital sweep PREFERS for options-vrp ($75k on a $50k account) does not
+# fit alongside the other two, and must be refused rather than silently sized.
+_bad = {"magic-formula": Allocation(1.0, 0.25), "options-vrp": Allocation(1.5, 0.18),
+        "trend-overlay": Allocation(1.0, 0.109)}
+expect("an over-allocated table is REJECTED, not silently sized",
+       check_allocations(_bad), want_ok=False)
+expect("  ... and the rejection names the cushion it computed",
+       Check("37.1%" in check_allocations(_bad).reason, check_allocations(_bad).reason))
+expect("a single sleeve over the whole account is REJECTED",
+       check_allocations({"magic-formula": Allocation(3.0, 0.25)}), want_ok=False)
+expect("negative fraction is REJECTED",
+       check_allocations({"x": Allocation(-1.0, 0.25)}), want_ok=False)
+expect("an empty table trivially passes (nothing allocated)", check_allocations({}))
+
+# Budget must track NetLiq, so a sleeve reaches its measured plateau without an edit.
+_b25, _ = allocated_budget("options-vrp", 25_000.0, 50_000.0)
+_b50, _ = allocated_budget("options-vrp", 50_000.0, 50_000.0)
+_b100, _ = allocated_budget("options-vrp", 100_000.0, 50_000.0)
+print(f"  options-vrp budget at NetLiq 25k/50k/100k = ${_b25:,.0f} / ${_b50:,.0f} / ${_b100:,.0f}")
+expect("budget scales with NetLiq", Check(_b25 < _b50 < _b100, f"{_b25},{_b50},{_b100}"))
+expect("budget at nominal == fraction x nominal", Check(abs(_b50 - 50_000.0) < 1e-6, f"{_b50}"))
+expect("budget FALLS with the account (no floor propping up a loss)",
+       Check(_b25 < _b50, f"{_b25} vs {_b50}"))
+_bcap, _ = allocated_budget("options-vrp", 10_000_000.0, 50_000.0)
+expect("growth capped at max_grow (guards a corrupted P&L ledger)",
+       Check(_bcap <= 3.0 * 50_000.0 + 1e-6, f"${_bcap:,.0f}"))
+
+_bn, _note = allocated_budget("options-vrp", None, 50_000.0)
+expect("NetLiq unavailable -> nominal share, and SAYS so",
+       Check(abs(_bn - 50_000.0) < 1e-6 and "UNAVAILABLE" in _note, _note))
+for _bad_nl in (float("nan"), 0.0, -1.0):
+    _b, _n = allocated_budget("options-vrp", _bad_nl, 50_000.0)
+    expect(f"NetLiq {_bad_nl!r} -> nominal fallback, not a poisoned size",
+           Check(abs(_b - 50_000.0) < 1e-6 and "UNAVAILABLE" in _n, _n))
+# A fraction != 1 must actually be APPLIED. Every shipped fraction is 1.0, so without this the
+# multiplication is a no-op and dropping it entirely survives mutation testing unnoticed.
+_half = {"half": Allocation(0.50, 0.20)}
+_bh, _ = allocated_budget("half", 50_000.0, 50_000.0, allocations=_half)
+expect("fraction is applied: 50% of a $50k account -> $25k budget",
+       Check(abs(_bh - 25_000.0) < 1e-6, f"${_bh:,.0f}"))
+_bq, _ = allocated_budget("half", 100_000.0, 50_000.0, allocations=_half)
+expect("  ... and still applied when NetLiq differs from nominal",
+       Check(abs(_bq - 50_000.0) < 1e-6, f"${_bq:,.0f}"))
+_bhn, _ = allocated_budget("half", None, 50_000.0, allocations=_half)
+expect("  ... and applied to the nominal fallback too",
+       Check(abs(_bhn - 25_000.0) < 1e-6, f"${_bhn:,.0f}"))
+
+_bu, _nu = allocated_budget("not-a-strategy", 50_000.0, 50_000.0)
+expect("unknown strategy -> 0 budget and refuses, rather than defaulting to something",
+       Check(_bu == 0.0 and "refusing" in _nu, _nu))
+
+# The peak-margin coefficients are the load-bearing numbers; pin them to their derivations.
+expect("options-vrp coef == max_positions x risk_per_trade (6 x 3%)",
+       Check(abs(ALLOCATIONS["options-vrp"].peak_margin_coef - 6 * 0.03) < 1e-9,
+             f"{ALLOCATIONS['options-vrp'].peak_margin_coef}"))
+expect("magic-formula coef == Reg-T maintenance on long stock (25%)",
+       Check(abs(ALLOCATIONS["magic-formula"].peak_margin_coef - 0.25) < 1e-9, ""))
+expect("trend coef == ~3.5% SPAN on ~3.12x notional",
+       Check(abs(ALLOCATIONS["trend-overlay"].peak_margin_coef - 0.035 * 3.12) < 0.002,
+             f"{ALLOCATIONS['trend-overlay'].peak_margin_coef}"))
+
+# End-to-end: the shipped table must actually clear the liquidity floor it is judged against.
+_tot = sum(a.fraction * a.peak_margin_coef for a in ALLOCATIONS.values()) * 50_000.0
+_lvl, _sc, _ = liquidity_check(50_000.0 - _tot, 50_000.0)
+expect("shipped allocations clear the liquidity floor at simultaneous peak",
+       Check(_lvl == "ok" and _sc == 1.0, f"got {_lvl}/{_sc}"))
 
 print("\n" + "=" * 78)
 if fails:
