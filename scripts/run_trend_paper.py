@@ -37,7 +37,7 @@ from trend_overlay.execution import (  # noqa: E402
 from risk_guard import (RiskLimits, effective_budget,  # noqa: E402
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
-                        circuit_breaker, peak_equity, margin_check, MarginLimits,
+                        circuit_breaker, peak_equity, liquidity_check, MarginLimits,
                         data_fresh, write_equity, book_drawdown, book_vol,
                         BreakerLevels, blended_vol)
 from trend_overlay.state import TrendState  # noqa: E402
@@ -173,9 +173,9 @@ def main() -> None:
         # $311,900 of notional against ~$10,900 of margin, collateralised by the equity book.
         # The reading is ACCOUNT-WIDE, so trend can be blocked by another strategy's usage —
         # correct, since the constraint really is shared.
-        _mu = broker.margin_usage()
-        _mlvl, _mscale, _mwhy = margin_check(*(_mu if _mu else (float("nan"), 0.0)),
-                                             limits=MarginLimits())
+        _mu = broker.margin_cushion()
+        _mlvl, _mscale, _mwhy = liquidity_check(*(_mu if _mu else (float("nan"), 0.0)),
+                                                limits=MarginLimits())
         if _mwhy:
             (logging.error if _mlvl in ("derisk", "halt") else logging.warning)(
                 "margin: %s", _mwhy)

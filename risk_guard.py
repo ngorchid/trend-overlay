@@ -500,10 +500,27 @@ def peak_equity(history, base: float, key: str = "total_pnl",
     return max([float(base)] + vals)
 
 
-# ---------------------------------------------------------------- shared-account margin ceiling
+# ------------------------------------------------------- shared-account liquidity floor
 @dataclass
 class MarginLimits:
-    """Margin-utilisation thresholds, as a fraction of net liquidation value.
+    """LIQUIDITY-CUSHION thresholds, as a fraction of net liquidation value.
+
+    Cushion = ExcessLiquidity / NetLiquidation — how far the account is from a forced
+    liquidation, which happens when ExcessLiquidity reaches zero. HIGH is safe; these are FLOORS,
+    not ceilings.
+
+    ⚠ WHY NOT GROSS MAINTENANCE MARGIN (the 2026-08-14 fix). This previously measured
+    MaintMarginReq / NetLiquidation against ceilings of 25/40/60%. Reg-T maintenance on long
+    stock is 25% of position value REGARDLESS OF LEVERAGE, so a fully-invested, entirely
+    unborrowed equity book sits at exactly 25% and tripped `no_new_risk` — blocking every new buy
+    in normal operation while sells continued, bleeding the book toward cash. Magic-formula
+    targets gross 1.0x, so that was its steady state, not an edge case. The old levels were
+    calibrated on the trend overlay's FUTURES margin, where usage does track leverage; for a cash
+    equity book it measured "how invested am I", which is not a risk at all.
+
+    ExcessLiquidity is the quantity an actual liquidation is measured against, and it is
+    leverage-aware by construction: an unlevered equity book has a ~75% cushion, while a book
+    levered to the edge has ~0 regardless of what asset class produced it.
 
     THE RISK THIS ADDRESSES is specific to running several strategies in ONE IB account, which is
     the right choice at small size: the trend overlay is a margin overlay on shared collateral
@@ -513,45 +530,53 @@ class MarginLimits:
     The price of sharing is that the equity book must sit in a MARGIN account, where a severe
     drawdown can force-liquidate stocks; and the collateral is CORRELATED with what it backs — in
     a crash equities fall while futures margin requirements RISE, so headroom shrinks exactly when
-    the requirement grows. No code removes that. This ceiling just makes sure we notice early and
+    the requirement grows. No code removes that. This floor just makes sure we notice early and
     stop adding to it, rather than discovering it at the liquidation.
 
-    Same shape as the treasury system's MAX_MARGIN_FRAC=0.25, which is already proven in this book.
+    Calibration: unlevered equities ~0.75, the intended three-strategy steady state ~0.52
+    (25% equity maintenance + ~5% futures + 18% VRP), so 0.30 leaves real room before it speaks.
+    At 0.10 a single 10% adverse move wipes the cushion, which is why that one is `halt`.
     """
-    max_new_risk: float = 0.25   # above this, no NEW positions
-    derisk: float = 0.40         # above this, halve target exposure
-    halt: float = 0.60           # above this, closing trades only
+    min_cushion_new_risk: float = 0.30   # below this, no NEW positions
+    min_cushion_derisk: float = 0.20     # below this, halve target exposure
+    min_cushion_halt: float = 0.10       # below this, closing trades only
 
 
-def margin_check(margin_used: float, net_liq: float,
-                 limits: MarginLimits | None = None) -> tuple[str, float, str]:
+def liquidity_check(excess_liquidity: float, net_liq: float,
+                    limits: MarginLimits | None = None) -> tuple[str, float, str]:
     """(level, exposure_scale, reason). Levels: ok | no_new_risk | derisk | halt.
+
+    Takes EXCESS LIQUIDITY, not margin used — renamed from `margin_check` so that a caller still
+    passing a maintenance-margin figure fails loudly instead of silently inverting the test.
 
     Note this is ACCOUNT-WIDE: in a shared account every strategy sees the total, so one strategy
     can be blocked by another's usage. That is correct — the constraint really is account-wide,
     and being blocked is strictly better than being liquidated.
 
-    As everywhere else here, `halt` must still permit CLOSING trades. A margin guard that blocks
-    the orders which would REDUCE margin is the worst possible failure mode.
+    As everywhere else here, `halt` must still permit CLOSING trades. A liquidity guard that
+    blocks the orders which would RESTORE the cushion is the worst possible failure mode.
     """
     lim = limits or MarginLimits()
-    mu, nl = _num(margin_used), _num(net_liq)
-    if mu is None or nl is None or nl <= 0:
+    xl, nl = _num(excess_liquidity), _num(net_liq)
+    if xl is None or nl is None or nl <= 0:
         # Distinct from "ok" ON PURPOSE: unknown must be visible in the log, not indistinguishable
         # from healthy. Scale stays 1.0 (fail-OPEN) because the order and gross caps already bound
         # notional, and therefore bound margin indirectly — and because blocking everything on a
         # transient API gap would also block the contract ROLLS that prevent physical delivery.
         # The caller may still choose to treat "unknown" as blocking.
-        return "unknown", 1.0, "MARGIN DATA UNAVAILABLE — ceiling not enforced this run"
-    used = mu / nl
-    if used >= lim.halt:
-        return "halt", 0.0, (f"margin {used:.0%} of NAV >= {lim.halt:.0%} — CLOSING TRADES ONLY; "
+        return "unknown", 1.0, "LIQUIDITY DATA UNAVAILABLE — cushion not enforced this run"
+    cushion = xl / nl
+    if cushion <= lim.min_cushion_halt:
+        return "halt", 0.0, (f"liquidity cushion {cushion:.0%} of NAV <= "
+                             f"{lim.min_cushion_halt:.0%} — CLOSING TRADES ONLY; "
                              f"liquidation risk")
-    if used >= lim.derisk:
-        return "derisk", 0.5, f"margin {used:.0%} of NAV >= {lim.derisk:.0%} — exposure halved"
-    if used >= lim.max_new_risk:
-        return "no_new_risk", 0.0, (f"margin {used:.0%} of NAV >= {lim.max_new_risk:.0%} — "
-                                    f"holding existing positions, no new ones")
+    if cushion <= lim.min_cushion_derisk:
+        return "derisk", 0.5, (f"liquidity cushion {cushion:.0%} of NAV <= "
+                               f"{lim.min_cushion_derisk:.0%} — exposure halved")
+    if cushion <= lim.min_cushion_new_risk:
+        return "no_new_risk", 0.0, (f"liquidity cushion {cushion:.0%} of NAV <= "
+                                    f"{lim.min_cushion_new_risk:.0%} — holding existing "
+                                    f"positions, no new ones")
     return "ok", 1.0, ""
 
 

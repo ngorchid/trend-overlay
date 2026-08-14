@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from risk_guard import (RiskLimits, chain_sane, check_batch, check_order,  # noqa: E402
-                        data_fresh, halted, price_sane)
+                        data_fresh, halted, liquidity_check, price_sane, Check)
 
 L = RiskLimits(budget=100_000.0)
 TODAY = pd.Timestamp("2026-08-11")
@@ -23,6 +23,12 @@ fails, ran = [], 0
 
 
 def expect(label: str, got, want_ok: bool) -> None:
+    """`got` MUST be a Check (or anything defining __bool__).
+
+    A plain ad-hoc object is ALWAYS truthy, so `expect(..., True)` on one can never
+    fail. Four cases here were written that way and silently passed regardless of
+    the code under test; a mutation run (2026-08-14) caught it.
+    """
     global ran
     ran += 1
     if bool(got) != want_ok:
@@ -97,7 +103,57 @@ orders = [{"ticker": f"T{i}", "side": "BUY", "qty": 40, "price": 300.0, "multipl
 acc, rej = check_batch(orders, L)
 print(f"  12 orders x $12,000 = $144,000 against a $100k budget and 1.10x gross cap")
 print(f"  -> accepted {len(acc)}, rejected {len(rej)}")
-expect("batch stops at the gross cap", type("C", (), {"ok": len(acc) < 12, "reason": ""})(), True)
+expect("batch stops at the gross cap", Check(len(acc) < 12), True)
+
+# ---------------------------------------------------------------- liquidity floor
+# Rewritten 2026-08-14 from gross maintenance margin to EXCESS LIQUIDITY. The old form measured
+# MaintMarginReq/NetLiq against ceilings; Reg-T maintenance on long stock is 25% of position value
+# regardless of leverage, so a fully-invested UNBORROWED equity book read as 25% "used" and tripped
+# no_new_risk in normal operation -- blocking every buy while sells continued. These cases pin the
+# property that broke: an unlevered book must be OK, and a levered one must still fire.
+print("\n--- liquidity floor (excess liquidity / NAV) ---")
+NAV = 50_000.0
+
+
+def lvl_of(maint_frac):
+    return liquidity_check(NAV - NAV * maint_frac, NAV)[0]
+
+
+def scale_of(maint_frac):
+    return liquidity_check(NAV - NAV * maint_frac, NAV)[1]
+
+
+# Scale is asserted alongside the level: a `derisk` that returned 1.0 would report correctly in
+# the log and silently not halve anything. A mutation run caught exactly that gap.
+for mf, want, want_scale, why in [
+    (0.25, "ok", 1.0, "fully invested unlevered equities (THE phase-1 regression)"),
+    (0.40, "ok", 1.0, "unlevered equities at 40% house maintenance"),
+    (0.48, "ok", 1.0, "three-strategy steady state"),
+    (0.70, "no_new_risk", 0.0, "levered: 30% cushion"),
+    (0.80, "derisk", 0.5, "levered hard: 20% cushion"),
+    (0.92, "halt", 0.0, "8% cushion -- near liquidation"),
+    (1.05, "halt", 0.0, "negative cushion -- already past it"),
+]:
+    got, got_scale = lvl_of(mf), scale_of(mf)
+    print(f"  maint {mf:>5.0%} -> cushion {1-mf:>5.0%}  {got:<12} scale {got_scale:.1f}  ({why})")
+    expect(f"liquidity floor at {mf:.0%} maintenance -> {want}",
+           Check(got == want, f"got {got}"), True)
+    expect(f"liquidity floor at {mf:.0%} maintenance -> scale {want_scale}",
+           Check(got_scale == want_scale, f"got scale {got_scale}"), True)
+
+# halt must still permit CLOSING trades: scale 0.0 means "no NEW risk", and every caller gates
+# only its open path on it. A liquidity guard that blocked the orders which RESTORE the cushion
+# would be the worst possible failure mode.
+expect("halt returns scale 0 (no new risk), not a blocked close",
+       Check(scale_of(1.05) == 0.0), True)
+
+# Unknown must be distinguishable from healthy AND fail-open: the order and gross caps already
+# bound notional, and blocking everything on a transient API gap would also block contract rolls.
+for lab, a, b in [("nan", float("nan"), NAV), ("None", None, NAV), ("zero NAV", 1000.0, 0.0)]:
+    l_, s_, _ = liquidity_check(a, b)
+    expect(f"liquidity {lab} -> unknown, fail-open",
+           Check(l_ == "unknown" and s_ == 1.0, f"got {l_}/{s_}"), True)
+
 
 print("\n" + "=" * 78)
 if fails:

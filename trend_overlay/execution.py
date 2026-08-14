@@ -344,27 +344,37 @@ class FuturesBroker:
             logging.error("IB connect failed: %s", e)
             return False
 
-    def margin_usage(self) -> tuple[float, float] | None:
-        """(maintenance margin used, net liquidation) for the WHOLE account, or None.
+    def margin_cushion(self) -> tuple[float, float] | None:
+        """(excess liquidity, net liquidation) for the WHOLE account, or None.
 
-        Account-wide on purpose: three strategies share this account, so the margin constraint
-        genuinely is shared and one strategy can legitimately be blocked by another's usage.
-        Being blocked beats being liquidated. MaintMarginReq rather than FullInitMarginReq
-        because maintenance is what an actual liquidation is measured against.
+        Account-wide on purpose: several strategies share this account, so the constraint
+        genuinely is shared.
 
-        Returns None on any failure, so the caller reports "unknown" rather than assuming healthy.
+        ⚠ ExcessLiquidity, NOT MaintMarginReq (changed 2026-08-14). Maintenance margin on long
+        stock is 25% of position value regardless of leverage, so a fully-invested unborrowed
+        equity book read as 25% "used" and tripped the ceiling in normal operation. Excess
+        liquidity is what an actual liquidation is measured against and is leverage-aware:
+        it goes to zero only when the account is genuinely near forced liquidation.
+
+        Returns None on any failure — the caller treats that as "unknown" and logs it, rather
+        than assuming healthy.
+
+        The dry-run / not-connected guard is NOT optional: without it this raises on every dry
+        run, the exception is caught, and a WARNING is logged — which the alert collector then
+        puts in the email subject and pushes to your phone. An alert channel that cries wolf on
+        every offline run is worse than none, because you learn to ignore it.
         """
         if self.dry_run or self.ib is None:
             return None
         try:
             rows = {r.tag: r for r in self.ib.accountSummary()}
-            mm = rows.get("MaintMarginReq") or rows.get("FullMaintMarginReq")
+            xl = rows.get("ExcessLiquidity") or rows.get("FullExcessLiquidity")
             nl = rows.get("NetLiquidation")
-            if not mm or not nl:
+            if not xl or not nl:
                 return None
-            return float(mm.value), float(nl.value)
+            return float(xl.value), float(nl.value)
         except Exception as e:  # noqa: BLE001
-            logging.warning("margin_usage failed: %s", e)
+            logging.warning("margin_cushion failed: %s", e)
             return None
 
     def disconnect(self):
