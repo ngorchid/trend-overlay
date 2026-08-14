@@ -724,7 +724,19 @@ def reconcile(expected: dict[str, float], actual: dict[str, float], label: str =
 # ---------------------------------------------------------------- book-level equity
 @dataclass
 class BookLevels(BreakerLevels):
-    """TIGHTER than the per-strategy levels, and that is the whole point.
+    """⚠ SUPERSEDED — prefer `BreakerLevels.from_vol(book_vol)` from `book_drawdown`.
+
+    Hard-coding the book levels tighter was WRONG whenever fewer than all three strategies are
+    running. The tightness is justified by DIVERSIFICATION — the book is quieter than any single
+    sleeve because the sleeves are uncorrelated — but during a STAGED GO-LIVE with one strategy
+    the book curve IS that strategy's curve, so 10/18/25 fired at -12.7% and -18.2% on a book
+    whose own correct levels are 23/38/53. That is precisely the capitulation zone measured on
+    the enhanced magic formula (13 of 13 triggers followed by gains, -0.34 Sharpe).
+
+    Vol-scaling the BOOK's own curve gets the same property for free and adapts to how many
+    strategies are actually live: one sleeve => book vol equals its vol => identical levels, no
+    double-counting; three uncorrelated sleeves => book vol is ~1/sqrt(3) of a sleeve's => levels
+    tighten automatically. Kept only so an explicit caller still works.
 
     ⚠ A book drawdown computed as 1 - sum(equity)/sum(peak) is a peak-WEIGHTED AVERAGE of the
     individual drawdowns, so it can never exceed the worst strategy. With the SAME thresholds a
@@ -767,6 +779,30 @@ def write_equity(root: Path | str, strategy: str, equity: float, peak: float) ->
         f.write_text(json.dumps(d, indent=2))
     except Exception as e:  # noqa: BLE001
         logging.warning("write_equity failed: %s", e)
+
+
+def book_vol(root: Path | str, min_obs: int = 60) -> float | None:
+    """Annualised vol of the BOOK's own recorded equity curve, or None if too little history.
+
+    Lets the book breaker scale to what is ACTUALLY running: with one strategy live the book vol
+    equals that strategy's, so its levels come out identical and the book check adds nothing
+    (correct — there is no diversification to reward). As strategies are added the curve quietens
+    and the levels tighten by themselves.
+    """
+    try:
+        f = Path(root) / "book_equity.json"
+        if not f.exists():
+            return None
+        hist = [float(h["total"]) for h in (json.loads(f.read_text()).get("book_history") or [])
+                if "total" in h]
+    except Exception:  # noqa: BLE001
+        return None
+    if len(hist) < min_obs:
+        return None
+    r = pd.Series(hist, dtype=float).pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(r) < min_obs - 1 or r.std() == 0:
+        return None
+    return float(r.std() * np.sqrt(252))
 
 
 def book_drawdown(root: Path | str, max_age_days: int = 5
