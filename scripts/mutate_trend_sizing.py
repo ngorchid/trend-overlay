@@ -65,6 +65,14 @@ MUTATIONS = [
      "        lim3 = 1e12",
      "contract-level cap limit set to infinity"),
 
+    # --- unusable input must HOLD, not flatten (fixed 2026-08-16) ---
+    ("        if vv != vv or vv <= 0 or sg != sg:\n            expo = float(\"nan\")",
+     "        if vv != vv or vv <= 0 or sg != sg:\n            expo = 0.0",
+     "unusable vol back to a ZERO target (dead feed liquidates the market)"),
+    ("    w = np.nan_to_num(w_raw, nan=0.0, posinf=0.0, neginf=0.0)",
+     "    w = w_raw",
+     "NaN weight reaches est_vol (silent fallback to INDEPENDENCE = bug #2 returns)"),
+
     # --- vol floor ---
     ("        vol_used = vol.where(floor.isna(), np.maximum(vol, floor))",
      "        vol_used = vol",
@@ -82,9 +90,12 @@ MUTATIONS = [
      "hysteresis band infinite (never trades)"),
 
     # --- SAFETY invariant ---
-    ("            if limits is not None and \"SAFETY\" not in (o.reason or \"\").upper():",
+    ("            if limits is not None and not getattr(o, \"safety\", False):",
      "            if limits is not None:",
      "SAFETY exemption removed -- a forced close becomes blockable"),
+    ("                                 safety=True))",
+     "                                 safety=False))",
+     "safety flag not set on forced closes (exemption silently stops applying)"),
     ("        if d <= spec.notice_buffer_days:",
      "        if d <= 0:",
      "notice buffer ignored (only closes AFTER last-trade, too late)"),

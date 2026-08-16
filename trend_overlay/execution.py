@@ -152,23 +152,41 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
     for s in specs:
         sg = float(sig[s.proxy_etf])
         vv, vv_raw = float(v[s.proxy_etf]), float(v_raw[s.proxy_etf])
-        # inverse-vol risk parity: each market ~ (budget*target_vol/sqrt(N)) of risk
-        expo = 0.0 if (vv == 0 or vv != vv) else sg * (cfg.budget * cfg.target_vol / np.sqrt(N)) / vv
-        # GUARD 2 — cap any single market's notional. The gross cap alone does NOT stop one
-        # low-vol market dominating the book.
-        if cfg.per_market_cap and cfg.per_market_cap > 0:
-            lim = cfg.per_market_cap * cfg.budget
-            if abs(expo) > lim:
-                logging.info("cap %s: $%s -> $%s (%.0f%% of budget; vol %.1f%%)",
-                             s.market, f"{expo:,.0f}", f"{np.sign(expo)*lim:,.0f}",
-                             100 * cfg.per_market_cap, 100 * vv_raw)
-                expo = float(np.sign(expo) * lim)
+        # inverse-vol risk parity: each market ~ (budget*target_vol/sqrt(N)) of risk.
+        # UNUSABLE INPUT -> NaN, NOT ZERO. A zero target is a legitimate instruction to flatten;
+        # NaN means "we do not know", and the hysteresis block below turns that into HOLD. This
+        # used to read `expo = 0.0 if (vv == 0 or vv != vv)`, so a market whose price feed died
+        # produced a clean zero target and was fully liquidated -- a round trip on missing data,
+        # in a framework whose whole premise is that a missed trade costs nothing and a bad fill
+        # costs money. A frozen (not absent) feed lands here too: constant prices give zero
+        # returns, hence zero vol.
+        if vv != vv or vv <= 0 or sg != sg:
+            expo = float("nan")
+        else:
+            expo = sg * (cfg.budget * cfg.target_vol / np.sqrt(N)) / vv
+        # NB there is no PRE-scale per-market cap. There was one until 2026-08-16; mutation
+        # testing showed it produced byte-identical output on every scenario tried (capped and
+        # uncapped books, scale above and below 1, correlated and independent, overlay 1.0 and
+        # 3.0). GUARD 2b below subsumes it -- capping before a multiplier is not a cap, which is
+        # why 2b was added in the first place -- and scale_clip absorbs its only other effect,
+        # which was on est_vol via w. Removed rather than left as unreachable code in a sizing
+        # path, where dead guards invite the assumption that something is protected.
         rows.append((s.market, sg, vv_raw, expo, s.notional(cfg.use_micro), s.sym(cfg.use_micro)))
     df = pd.DataFrame(rows, columns=["market", "signal", "ann_vol", "dollar_exposure", "notional", "ib_symbol"]).set_index("market")
 
     # aggregate vol-target: scale so estimated book vol ≈ target_vol, using the FULL covariance
     # (see the config comment for why assuming independence understated vol by 20-30%).
-    w = (df["dollar_exposure"] / cfg.budget).values          # fraction of budget per market
+    # NaN weights must NOT reach the covariance: w @ Sigma @ w would return NaN, `est_vol > 0`
+    # would then be False, scale would fall to 0.0 and EVERY market would be flattened -- one
+    # dead feed liquidating the whole book. Excluded from the estimate instead (they are being
+    # held, not resized). This understates book vol by the held market's contribution, which is
+    # the conservative direction only if that market is small; it is logged so it is never silent.
+    w_raw = (df["dollar_exposure"] / cfg.budget).values       # fraction of budget per market
+    _unusable = ~np.isfinite(w_raw)
+    if _unusable.any():
+        logging.warning("unusable vol for %s — HOLDING those positions and excluding them from "
+                        "the vol-target estimate", ", ".join(df.index[_unusable]))
+    w = np.nan_to_num(w_raw, nan=0.0, posinf=0.0, neginf=0.0)
     sig_vec = v[[s.proxy_etf for s in specs]].values         # floored vols, aligned to df
     est_vol = _portfolio_vol(w, sig_vec, rets[[s.proxy_etf for s in specs]], cfg)
     lo, hi = cfg.scale_clip
@@ -220,7 +238,13 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
                 ct.append(int(np.round(x)) if abs(x - n) >= band else n)
         df["contracts"] = pd.Series(ct, index=df.index).astype(int)
     else:
-        df["contracts"] = raw.round().astype(int)
+        # Without `held` there is nothing to hold ONTO, so a non-finite target cannot be honoured.
+        # Live always passes `held`; this path is dry-run/offline. Warn rather than crash on
+        # .astype(int), which raises on NaN.
+        if not np.isfinite(raw.to_numpy()).all():
+            logging.warning("non-finite target for %s and no `held` provided — cannot HOLD, "
+                            "treating as flat", ", ".join(raw.index[~np.isfinite(raw)]))
+        df["contracts"] = raw.fillna(0.0).round().astype(int)
     if cfg.per_market_cap and cfg.per_market_cap > 0:
         lim3 = cfg.per_market_cap * cfg.budget * cfg.overlay_multiple
         too_big = (df["contracts"].abs() * df["notional"]) > lim3 * 1.001
@@ -266,6 +290,11 @@ class RollOrder:
     action: str          # BUY | SELL
     qty: int
     reason: str
+    # Explicit, not inferred from `reason`. The pre-trade guard used to exempt forced closes by
+    # testing `"SAFETY" in reason.upper()`, which made a human-readable log string load-bearing:
+    # rewording it would have silently made forced closes blockable, and a physically-delivered
+    # contract could then run to delivery. A flag cannot be broken by an edit to prose.
+    safety: bool = False
 
 
 def days_to_expiry(expiry: str, today) -> int:
@@ -287,7 +316,8 @@ def safety_closes(held: list[HeldPosition], specs_by_market: dict, today) -> lis
         if d <= spec.notice_buffer_days:
             out.append(RollOrder(h.ib_symbol, h.expiry, "SELL" if h.qty > 0 else "BUY",
                                  abs(int(h.qty)),
-                                 f"SAFETY force-close: {d}d to last-trade <= {spec.notice_buffer_days}d buffer"))
+                                 f"SAFETY force-close: {d}d to last-trade <= {spec.notice_buffer_days}d buffer",
+                                 safety=True))
     return out
 
 
@@ -461,7 +491,8 @@ class FuturesBroker:
             {market, symbol, expiry, action, qty, mult, fill_price, status, reason}
         (fill_price None if not filled within `wait` — e.g. a queued/off-hours order).
 
-        `limits` (a RiskLimits) enables the independent pre-trade guard. It re-derives each
+        `limits` (a RiskLimits) enables the independent pre-trade guard. Orders carrying
+        `safety=True` are exempt (see RollOrder). It re-derives each
         order's notional from the budget rather than trusting compute_targets, because a guard
         reusing the strategy's arithmetic cannot catch the strategy's own bug — and this file had
         exactly such a bug (a per-market cap that was applied before a multiplier and so never
@@ -479,7 +510,7 @@ class FuturesBroker:
             base = {"market": spec.market if spec else "?", "symbol": o.ib_symbol,
                     "expiry": o.expiry, "action": o.action, "qty": o.qty, "mult": mult,
                     "reason": o.reason}
-            if limits is not None and "SAFETY" not in (o.reason or "").upper():
+            if limits is not None and not getattr(o, "safety", False):
                 notl = spec.notional(use_micro) if spec else 0.0
                 px = notl / mult if mult else 0.0
                 chk = check_order(o.ib_symbol, o.action, abs(o.qty), px, mult, limits,

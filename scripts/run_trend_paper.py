@@ -20,6 +20,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -35,6 +36,7 @@ from trend_overlay.execution import (  # noqa: E402
     compute_targets, plan_roll_orders, safety_closes,
 )
 from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+                        stale_columns,
                         check_allocations,
                         install_alert_collector, missed_runs, push_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
@@ -253,10 +255,22 @@ def main() -> None:
                 # A frozen feed still yields a signal, a vol estimate and a full target book —
                 # all plausible, all wrong. price sanity cannot catch it: each price is valid,
                 # just old.
-                _fresh = data_fresh(px.index, pd.Timestamp(today),
-                                    RiskLimits.for_futures(cfg.budget))
+                _lim_f = RiskLimits.for_futures(cfg.budget)
+                _fresh = data_fresh(px.index, pd.Timestamp(today), _lim_f)
                 if not _fresh:
                     logging.error("data staleness: %s — SAFETY closes only today", _fresh.reason)
+                # PER-COLUMN staleness. data_fresh sees only the INDEX, so one market's feed
+                # dying or freezing leaves the panel looking current and reaches sizing as a
+                # legitimate signal. NaN the offenders so compute_targets HOLDS them (a
+                # non-finite target is the hold signal) instead of trading on a stale price.
+                # Deliberately per-market rather than a global halt: one dead ticker should not
+                # stop the other nine from being managed.
+                _stale, _sc = stale_columns(px, pd.Timestamp(today), _lim_f)
+                if _stale:
+                    logging.error("per-column staleness: %s — those markets will be HELD, "
+                                  "not resized", _sc.reason)
+                    for _c in _stale:
+                        px[_c] = np.nan
 
             if args.safety_only or not _fresh:
                 batches = [("SAFETY", safety)]

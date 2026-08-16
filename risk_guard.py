@@ -176,6 +176,46 @@ def data_fresh(index: pd.Index, today: pd.Timestamp, limits: RiskLimits) -> Chec
     return PASS
 
 
+def stale_columns(frame, today: pd.Timestamp, limits: RiskLimits,
+                  ) -> tuple[dict[str, int], Check]:
+    """Per-COLUMN staleness: {column -> days since it last moved}, and a Check over the frame.
+
+    `data_fresh` only inspects the INDEX, so it answers "did the panel update?" — not "did this
+    market's price update?". A single dead or frozen column leaves the index perfectly current
+    and every downstream number plausible. Found 2026-08-16: one market's feed dying was
+    invisible to every guard, and reached sizing as a legitimate signal.
+
+    TWO FAILURE MODES, deliberately both:
+      ABSENT  the column's last non-NaN observation is old (provider dropped the ticker).
+      FROZEN  the column still reports, but the VALUE has not changed. This is the dangerous
+              one: prices are valid, just repeated, so nothing is NaN and nothing errors —
+              while realised vol collapses toward zero and inverse-vol sizing divides by it.
+
+    Returns the offenders rather than a verdict on the whole run, because the right response is
+    per-market (hold that one, keep trading the rest), not a global halt.
+    """
+    out: dict[str, int] = {}
+    if frame is None or getattr(frame, "empty", True):
+        return out, Check(False, "empty price frame")
+    now = pd.Timestamp(today).normalize()
+    for col in frame.columns:
+        ser = frame[col].dropna()
+        if ser.empty:
+            out[col] = 10_000
+            continue
+        # Last date the value actually MOVED. A column repeating one price is stale even though
+        # its last observation is today.
+        changed = ser[ser.diff().fillna(1.0) != 0]
+        last = pd.Timestamp(changed.index[-1] if len(changed) else ser.index[0]).normalize()
+        age = int((now - last).days)
+        if age > limits.max_data_age_days:
+            out[col] = age
+    if out:
+        worst = ", ".join(f"{c} {a}d" for c, a in sorted(out.items(), key=lambda kv: -kv[1]))
+        return out, Check(False, f"stale columns (limit {limits.max_data_age_days}d): {worst}")
+    return out, PASS
+
+
 def price_sane(ticker: str, price: float, prior: float | None, limits: RiskLimits) -> Check:
     """Is this a plausible price given the previous close?
 

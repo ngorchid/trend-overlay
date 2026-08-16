@@ -307,22 +307,59 @@ expect("band 0 / held=None falls back to round()",
        Check(int(compute_targets(lo_vol, TrendPaperConfig(budget=250_000.0, per_market_cap=0.0, gross_cap=0.0,
                                                  hysteresis_band=0.0),
                                  SPECS, held=held_out).at[mkt, "contracts"]) == n_round, ""))
-# ⚠ DOCUMENTED DISCREPANCY, pinned deliberately. The hysteresis block carries a comment
-# saying a non-finite target means missing data and must HOLD. It cannot: upstream,
-# `expo = 0.0 if (vv == 0 or vv != vv)` converts a NaN vol into a legitimate ZERO target, so
-# `raw` is finite, the isfinite branch never fires, and |0 - held| >= band FLATTENS the market.
-# So a single market losing its price feed produces a full round-trip liquidation of that
-# market, not a hold. data_fresh does not catch it either: the index is fine, one COLUMN is NaN.
-# Pinned as-is rather than changed, because flattening an unmeasurable position is defensible
-# and altering live sizing behaviour is a decision, not a test fix. But the comment is wrong.
+# FIXED 2026-08-16. This previously FLATTENED: upstream `expo = 0.0 if vv != vv` turned a NaN
+# vol into a legitimate ZERO target, so `raw` was finite, the isfinite branch never fired, and a
+# market whose feed died was fully liquidated -- a round trip on missing data, in a framework
+# whose premise is that a missed trade costs nothing and a bad fill costs money. Unusable input
+# now yields a NaN target, which the hysteresis block turns into HOLD.
 nan_px = lo_vol.copy(); nan_px.iloc[-CFG.vol_window:, 0] = np.nan
 held_nan = {m: 2 for m in base_t.index}
 t_nan = compute_targets(nan_px, CFG, SPECS, held=held_nan)
-expect("a market with a dead price feed is FLATTENED (not held, despite the code comment)",
-       Check(int(t_nan.at[SPECS[0].market, "contracts"]) == 0,
-             f"got {int(t_nan.at[SPECS[0].market, 'contracts'])}"))
-expect("  ... and its exposure is exactly zero, never NaN",
-       Check(float(t_nan.at[SPECS[0].market, "dollar_exposure"]) == 0.0, ""))
+expect("a market with a DEAD feed is HELD, not flattened",
+       Check(int(t_nan.at[SPECS[0].market, "contracts"]) == 2,
+             f"got {int(t_nan.at[SPECS[0].market, 'contracts'])}, held 2"))
+expect("  ... its target is NaN (the hold signal), not a legitimate zero",
+       Check(not np.isfinite(t_nan.at[SPECS[0].market, "dollar_exposure"]), ""))
+# A FROZEN feed is the more dangerous variant: prices stay valid, so nothing is NaN and nothing
+# errors, while realised vol collapses toward zero and inverse-vol sizing divides by it.
+froz = lo_vol.copy(); froz.iloc[-90:, 0] = froz.iloc[-91, 0]
+t_fr = compute_targets(froz, CFG, SPECS, held=held_nan)
+expect("a market with a FROZEN feed is also HELD (zero vol is unusable, not calm)",
+       Check(int(t_fr.at[SPECS[0].market, "contracts"]) == 2,
+             f"got {int(t_fr.at[SPECS[0].market, 'contracts'])}"))
+# One dead feed must not flatten the BOOK: a NaN weight reaching w'Sigma w makes est_vol NaN,
+# `est_vol > 0` False, scale 0.0 -- and every market goes to zero.
+# Must exclude the DEAD market from the check: it is being HELD at 2 contracts, so a total
+# over all markets stays non-zero even when every healthy market has been flattened to nothing.
+# The first version of this case asserted the total and survived exactly that mutation.
+_healthy = t_nan["contracts"].drop(SPECS[0].market)
+expect("one dead feed does NOT flatten the HEALTHY markets (NaN must not poison est_vol)",
+       Check(int(_healthy.abs().sum()) > 0,
+             f"healthy markets all flat: {_healthy.to_dict()}"))
+# NB the healthy markets' sizing DOES shift when a feed dies, and that is correct: excluding
+# the dead market from est_vol changes the estimate, hence the scale. Asserting they are
+# unchanged would be asserting something false, so it is not asserted.
+#
+# What MUST hold is that the surviving markets are still estimated with the COVARIANCE. A NaN
+# weight reaching `w @ Sigma @ w` makes var NaN; `var > 0` is then False and _portfolio_vol
+# silently returns its INDEPENDENCE fallback -- reinstating bug #2 for the whole book the moment
+# any single feed dies (measured: 0.1732 vs 0.2759, a 37% understatement, i.e. too much
+# leverage). Nothing flattens, which is why this is easy to miss. Correlation is again the clean
+# instrument: with the NaN excluded properly, correlation still moves gross; under the fallback
+# both books collapse to the same independence number.
+_dead_free = TrendPaperConfig(per_market_cap=0.0, gross_cap=0.0)
+def _gross_dead(corr):
+    p = panel([0.20] * 4, corr=corr, seed=3).copy()
+    p.iloc[-CFG.vol_window:, 0] = np.nan                       # kill one feed
+    return gross_of(compute_targets(p, _dead_free, SPECS,
+                                    held={m: 0 for m in base_t.index}), _dead_free)
+_gd_lo, _gd_hi = _gross_dead(0.0), _gross_dead(0.9)
+print(f"    with a dead feed: corr 0.0 -> gross {_gd_lo:.3f}x ; corr 0.9 -> gross {_gd_hi:.3f}x")
+expect("with one feed dead, the REST are still estimated with the covariance",
+       Check(abs(_gd_lo - _gd_hi) > 1e-6,
+             f"{_gd_lo:.6f} vs {_gd_hi:.6f} — identical means the independence fallback fired"))
+expect("  ... and the correlated book is still sized smaller",
+       Check(_gd_hi < _gd_lo, f"corr0.9 {_gd_hi:.4f} vs corr0.0 {_gd_lo:.4f}"))
 expect("  ... while the markets with live data are unaffected",
        Check(int(t_nan.at[SPECS[3].market, "contracts"]) != 0, ""))
 
@@ -384,14 +421,19 @@ expect("INVARIANT: a SAFETY close is NOT risk-rejected, however tight the limits
        Check(f_safe[0]["status"] != "RiskRejected", f"{f_safe[0]['status']}"))
 expect("  ... while an ordinary order at the same limits IS rejected (guard is not vacuous)",
        Check(f_norm[0]["status"] == "RiskRejected", f"{f_norm[0]['status']}"))
-expect("the exemption is a SUBSTRING match on reason — pinned because it is fragile",
+expect("the exemption is an explicit FLAG, not a substring of the reason text",
+       Check(brk.execute([RollOrder(spec0.sym(True), near, "SELL", 3,
+                                    "wording changed entirely", safety=True)],
+                         BY_MKT, True, limits=TIGHT)[0]["status"] != "RiskRejected", ""))
+expect("  ... so an order merely MENTIONING safety is still guarded (no accidental exemption)",
        Check(brk.execute([RollOrder(spec0.sym(True), near, "SELL", 3,
                                     "SAFETY force-close: 1d to last-trade")],
-                         BY_MKT, True, limits=TIGHT)[0]["status"] != "RiskRejected", ""))
-expect("  ... and an order WITHOUT the marker is guarded (so the marker is load-bearing)",
-       Check(brk.execute([RollOrder(spec0.sym(True), near, "SELL", 3,
-                                    "force-close: 1d to last-trade")],
-                         BY_MKT, True, limits=TIGHT)[0]["status"] == "RiskRejected", ""))
+                         BY_MKT, True, limits=TIGHT)[0]["status"] == "RiskRejected",
+             "reason text must no longer be load-bearing"))
+expect("safety_closes sets the flag on every order it emits",
+       Check(all(o.safety for o in sc + sc_s), ""))
+expect("plan_roll_orders does NOT set it (ordinary orders stay guarded)",
+       Check(not RollOrder(spec0.sym(True), far, "BUY", 1, "reconcile").safety, ""))
 
 print("\n--- days_to_expiry ---")
 expect("YYYYMMDD parsed", Check(days_to_expiry("20260826", TODAY) == 10, ""))

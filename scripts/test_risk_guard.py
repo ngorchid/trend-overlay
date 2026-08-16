@@ -17,7 +17,8 @@ sys.path.insert(0, str(ROOT))
 from risk_guard import (RiskLimits, chain_sane, check_batch, check_order,  # noqa: E402
                         data_fresh, halted, liquidity_check, price_sane, Check,
                         ALLOCATIONS, Allocation, MIN_ALLOCATION_CUSHION,
-                        allocated_budget, allocation_cushion, check_allocations)
+                        allocated_budget, allocation_cushion, check_allocations,
+                        stale_columns)
 
 L = RiskLimits(budget=100_000.0)
 TODAY = pd.Timestamp("2026-08-11")
@@ -240,6 +241,43 @@ _tot = sum(a.fraction * a.peak_margin_coef for a in ALLOCATIONS.values()) * 50_0
 _lvl, _sc, _ = liquidity_check(50_000.0 - _tot, 50_000.0)
 expect("shipped allocations clear the liquidity floor at simultaneous peak",
        Check(_lvl == "ok" and _sc == 1.0, f"got {_lvl}/{_sc}"))
+
+# ---------------------------------------------------------------- per-column staleness
+# Added 2026-08-16. data_fresh inspects only the INDEX, so a single dead or frozen COLUMN left
+# the panel looking current and reached sizing as a legitimate signal. FROZEN is the dangerous
+# case: prices are valid, just repeated, so nothing is NaN and nothing errors -- while realised
+# vol collapses toward zero and inverse-vol sizing divides by it.
+print("\n--- per-column staleness ---")
+_idx = pd.bdate_range(end=TODAY, periods=40)
+_good = pd.Series(np.linspace(100, 110, len(_idx)), index=_idx)
+_frame = pd.DataFrame({
+    "LIVE": _good,
+    "FROZEN": pd.Series([100.0] * len(_idx), index=_idx),          # reports, never moves
+    "ABSENT": pd.Series([100.0] * 5 + [np.nan] * (len(_idx) - 5), index=_idx),
+    "RECENT_STOP": pd.Series(list(np.linspace(100, 105, len(_idx) - 2)) + [105.0, 105.0],
+                             index=_idx),                           # stopped 2d ago: still fresh
+})
+_st, _chk = stale_columns(_frame, TODAY, L)
+print(f"  detected: {_st}")
+expect("a FROZEN column is flagged (valid prices, never changing)", Check("FROZEN" in _st, f"{_st}"))
+expect("an ABSENT column is flagged", Check("ABSENT" in _st, f"{_st}"))
+expect("a LIVE column is NOT flagged", Check("LIVE" not in _st, f"{_st}"))
+expect("a column that stopped moving 2d ago is NOT flagged (inside the limit)",
+       Check("RECENT_STOP" not in _st, f"{_st}"))
+expect("the Check fails when any column is stale", _chk, want_ok=False)
+expect("  ... and its reason names the offenders",
+       Check("FROZEN" in _chk.reason and "ABSENT" in _chk.reason, _chk.reason))
+_st2, _chk2 = stale_columns(_frame[["LIVE"]], TODAY, L)
+expect("an all-live frame passes with no offenders", Check(_chk2.ok and not _st2, f"{_st2}"))
+_st3, _chk3 = stale_columns(pd.DataFrame(), TODAY, L)
+expect("an empty frame fails rather than silently passing", _chk3, want_ok=False)
+expect("an all-NaN column is flagged, not skipped",
+       Check("X" in stale_columns(pd.DataFrame({"X": [np.nan] * 5},
+                                                index=pd.bdate_range(end=TODAY, periods=5)),
+                                   TODAY, L)[0], ""))
+# data_fresh is blind to all of this -- which is the gap this closes.
+expect("data_fresh alone does NOT catch a frozen column (the gap being closed)",
+       data_fresh(_frame.index, TODAY, L))
 
 print("\n" + "=" * 78)
 if fails:
