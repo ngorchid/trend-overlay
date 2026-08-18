@@ -36,6 +36,7 @@ from trend_overlay.execution import (  # noqa: E402
     compute_targets, plan_roll_orders, safety_closes,
 )
 from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+                        code_version,
                         stale_columns,
                         check_allocations,
                         install_alert_collector, missed_runs, push_if_alerts,
@@ -159,6 +160,10 @@ def main() -> None:
     # KILL SWITCH. HALT_ALL exits before connecting; HALT freezes exposure but still ROLLS —
     # a physically-delivered contract (ZB, ZN, SIL) left past its notice date goes to DELIVERY,
     # so a halt that blocks rolls is more dangerous than the situation prompting it.
+    # Report WHICH COMMIT is running before anything else. Placed above the kill switch so it
+    # is recorded even on a halted run: "the box is running week-old code" is exactly the kind of
+    # thing you want to learn from a halted day's log, not discover a month later.
+    code_version(ROOT)
     _halt, _hwhy = halt_state(ROOT)
     if _halt == HALT_ALL:
         logging.error("HALTED (all): %s — exiting without trading. NOTE: delivery/roll safety "

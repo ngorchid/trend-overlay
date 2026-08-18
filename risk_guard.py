@@ -828,6 +828,58 @@ def missed_runs(history, today: str, date_key: str = "date") -> tuple[int, str |
                        f"connection failed on those days")
 
 
+# ---------------------------------------------------------------- deployed code version
+def code_version(root: Path | str, upstream: str = "origin/master", warn_behind: int = 5,
+                 fetch: bool = True, timeout: float = 15.0) -> tuple[str, int | None]:
+    """(note, commits_behind) — which commit is actually running, and how stale it is.
+
+    WHY. On 2026-08-17 the live branch drifted 10 commits behind master within 48 hours of
+    go-live, so the real-money account ran with the margin-ceiling bug (maintenance margin vs a
+    25% ceiling, which blocks every buy once the book is fully invested), an inert price_sane, no
+    negative-share guard and no per-column staleness. NOTHING SURFACED IT. The remaining link in
+    the deploy chain was "remember to merge", and this replaces remembering with reporting.
+
+    Fetches first (read-only, never touches the working tree) because otherwise the comparison is
+    against whatever ref was last pulled, which is exactly the state that goes stale. Best-effort:
+    no network, no git, not a checkout, or a slow remote all degrade to reporting the SHA alone.
+    This runs inside a trading process, so it must never raise and never hang.
+
+    Logs at INFO normally and WARNING only past `warn_behind`, because on the live box being a
+    commit or two behind between deploys is NORMAL. Warning on every non-zero value would put a
+    line in the email subject and a push on your phone every single day, which is how an alert
+    channel gets ignored — the failure this whole module keeps guarding against.
+    """
+    import subprocess
+
+    def _git(*args, t=5.0):
+        try:
+            r = subprocess.run(("git", "-C", str(root)) + args, capture_output=True,
+                               text=True, timeout=t)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:  # noqa: BLE001  (subprocess, OSError, timeout — none may propagate)
+            return None
+
+    sha = _git("rev-parse", "--short", "HEAD")
+    if sha is None:
+        return "code version unknown (not a git checkout)", None
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "?"
+    if fetch:
+        _git("fetch", "--quiet", *upstream.split("/", 1), t=timeout)
+    behind_s = _git("rev-list", "--count", f"HEAD..{upstream}")
+    try:
+        behind = int(behind_s) if behind_s is not None else None
+    except ValueError:
+        behind = None
+    if behind is None:
+        return f"running {sha} ({branch}) — cannot compare to {upstream}", None
+    note = f"running {sha} ({branch}) — {behind} commit(s) behind {upstream}"
+    if behind >= warn_behind:
+        logging.warning("CODE IS STALE: %s — merge master into this branch and redeploy", note)
+    else:
+        logging.info("code version: %s", note)
+    return note, behind
+
+
 # ---------------------------------------------------------------- out-of-band alerting
 def push_alert(title: str, message: str, api_key: str | None = None) -> bool:
     """Send a Pushbullet note. Returns True if it went out. NEVER raises.

@@ -4,6 +4,7 @@ Run: python scripts/test_risk_guard.py
 """
 from __future__ import annotations
 
+import logging
 import sys
 import tempfile
 from pathlib import Path
@@ -18,7 +19,7 @@ from risk_guard import (RiskLimits, chain_sane, check_batch, check_order,  # noq
                         data_fresh, halted, liquidity_check, price_sane, Check,
                         ALLOCATIONS, Allocation, MIN_ALLOCATION_CUSHION,
                         allocated_budget, allocation_cushion, check_allocations,
-                        stale_columns)
+                        stale_columns, code_version, AlertCollector)
 
 L = RiskLimits(budget=100_000.0)
 TODAY = pd.Timestamp("2026-08-11")
@@ -278,6 +279,56 @@ expect("an all-NaN column is flagged, not skipped",
 # data_fresh is blind to all of this -- which is the gap this closes.
 expect("data_fresh alone does NOT catch a frozen column (the gap being closed)",
        data_fresh(_frame.index, TODAY, L))
+
+# ---------------------------------------------------------------- deployed code version
+# Added 2026-08-18. The live branch drifted 10 commits behind master within 48 hours of go-live,
+# so the real-money account ran with the margin-ceiling bug, an inert price_sane and no stale
+# detection -- and NOTHING SURFACED IT. The last link in the deploy chain was "remember to
+# merge"; this replaces remembering with reporting.
+print("\n--- deployed code version ---")
+_note, _behind = code_version(ROOT, fetch=False)
+print(f"  {_note}")
+expect("reports a SHA and a behind-count in a real checkout",
+       Check(_behind is not None and "running" in _note, _note))
+expect("  ... naming the branch, so live-vs-master is visible at a glance",
+       Check("(" in _note and ")" in _note, _note))
+# Degradation must be graceful: this runs inside a trading process and may never raise or hang.
+_n2, _b2 = code_version(tempfile.gettempdir(), fetch=False)
+expect("a non-git directory degrades to a note, not an exception",
+       Check(_b2 is None and "unknown" in _n2, _n2))
+_n3, _b3 = code_version(ROOT, upstream="origin/does-not-exist", fetch=False)
+expect("a missing upstream degrades gracefully rather than raising",
+       Check(_b3 is None and "cannot compare" in _n3, _n3))
+
+# THE POINT OF THE THING: staleness must reach the ALERT channel, not just the log. Compare
+# against an ancestor so HEAD is genuinely 'behind' it by 0 -- then force the threshold to 0 so
+# the warning path is exercised deterministically, without depending on repo state.
+def _quiet_probe_records():
+    """Records emitted when the checkout is CURRENT — must contain no staleness warning."""
+    q = AlertCollector()
+    q.setLevel(logging.WARNING)
+    logging.getLogger().addHandler(q)
+    try:
+        code_version(ROOT, upstream="HEAD", warn_behind=5, fetch=False)
+    finally:
+        logging.getLogger().removeHandler(q)
+    return q.records
+
+
+_probe = AlertCollector()
+_probe.setLevel(logging.WARNING)
+logging.getLogger().addHandler(_probe)
+try:
+    code_version(ROOT, upstream="HEAD", warn_behind=0, fetch=False)
+finally:
+    logging.getLogger().removeHandler(_probe)
+# AlertCollector stores (levelname, message) TUPLES, not LogRecords.
+expect("being stale raises a WARNING (so it reaches the email subject and phone push)",
+       Check(any(lvl == "WARNING" and "CODE IS STALE" in msg for lvl, msg in _probe.records),
+             f"{_probe.records}"))
+expect("  ... and a CURRENT checkout does not (no daily cry-wolf)",
+       Check(not any("CODE IS STALE" in msg for lvl, msg in
+                     _quiet_probe_records()), "a current box must stay silent"))
 
 print("\n" + "=" * 78)
 if fails:
