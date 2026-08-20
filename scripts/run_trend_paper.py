@@ -302,7 +302,7 @@ def main() -> None:
                 batches = [("SAFETY", safety), ("ROLL+RECONCILE", rolls)]
             lim = RiskLimits.for_futures(cfg.budget)
             for label, batch in batches:
-                fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim)
+                fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim, held=held)
                 for f in fills:
                     signed = f["qty"] if f["action"] == "BUY" else -f["qty"]
                     if f["fill_price"]:

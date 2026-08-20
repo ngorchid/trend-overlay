@@ -485,7 +485,7 @@ class FuturesBroker:
         return out
 
     def execute(self, orders: list[RollOrder], specs_by_market: dict, use_micro: bool,
-                wait: float = 20.0, limits=None) -> list[dict]:
+                wait: float = 20.0, limits=None, held: list[HeldPosition] | None = None) -> list[dict]:
         """Place a list of RollOrders, each on its specific (symbol, expiry) contract.
         Returns fills for state accounting:
             {market, symbol, expiry, action, qty, mult, fill_price, status, reason}
@@ -503,6 +503,9 @@ class FuturesBroker:
         from ib_insync import Future, MarketOrder
         fills: list[dict] = []
         gross_seen = 0.0
+        # Current signed holding per contract, so the guard can tell a position-REDUCING order
+        # (always allowed) from an exposure-GROWING one (size-capped). See check_order.
+        held_now = {(h.ib_symbol, h.expiry): h.qty for h in (held or [])}
         for o in orders:
             spec = next((s for s in specs_by_market.values()
                          if o.ib_symbol in (s.symbol, s.micro_symbol)), None)
@@ -513,14 +516,25 @@ class FuturesBroker:
             if limits is not None and not getattr(o, "safety", False):
                 notl = spec.notional(use_micro) if spec else 0.0
                 px = notl / mult if mult else 0.0
+                cur = held_now.get((o.ib_symbol, o.expiry), 0)      # signed contracts of THIS contract
+                cur_notl = cur * notl
+                order_notl = abs(o.qty) * notl
+                grows = abs(cur_notl + (order_notl if o.action == "BUY" else -order_notl)) > abs(cur_notl) + 1e-6
                 chk = check_order(o.ib_symbol, o.action, abs(o.qty), px, mult, limits,
+                                  current_position_notional=cur_notl,
                                   gross_notional=gross_seen,
                                   max_gross_frac=limits.max_gross_frac)
                 if not chk:
-                    logging.warning("RISK REJECT %s", chk.reason)
+                    # Deferrable = instrument too big for the CURRENT budget (e.g. a full-size
+                    # treasury on a small book): expected, self-heals as the book grows, so log at
+                    # INFO instead of alarming the daily email every run. Genuine rejects stay
+                    # WARNING. A position-reducing order is never rejected here (see check_order).
+                    (logging.info if chk.deferrable else logging.warning)(
+                        "%s: %s", "RISK DEFER" if chk.deferrable else "RISK REJECT", chk.reason)
                     fills.append({**base, "fill_price": None, "status": "RiskRejected"})
                     continue
-                gross_seen += abs(o.qty) * notl
+                if grows:      # only exposure-growing orders add to the run's running gross; a reduce lowers it
+                    gross_seen += order_notl
             if self.dry_run:
                 logging.info("[DRY RUN] %s %d %s %s  (%s)", o.action, o.qty, o.ib_symbol, o.expiry, o.reason)
                 fills.append({**base, "fill_price": None, "status": "dryrun"})
