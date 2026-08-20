@@ -284,12 +284,12 @@ def check_order(ticker: str, side: str, qty: float, price: float, multiplier: fl
     # size cap. A guard that blocks closes can trap a position it earlier allowed — after a budget
     # cut, a rule change, or a position bought before the guard existed — leaving no way to close or
     # roll it (exactly what happened to the full-size treasuries). Only exposure-GROWING orders are
-    # size-capped. (SAFETY/delivery closes are already exempt a level up in execute() via the
-    # `safety` flag; this also covers ordinary reduces and roll-outs.)
+    # size-capped. (Forced/delivery closes are already exempt a level up in the callers -- in
+    # trend via the RollOrder `safety` flag; this also covers ordinary reduces and roll-outs.)
     grows = after > abs(current_position_notional) + 1e-6
     if grows:
         # "deferrable" separates a reject caused by the INSTRUMENT being too big for the CURRENT
-        # budget -- even ONE contract exceeds the order cap, which self-heals as the book grows and
+        # budget -- even ONE unit exceeds the order cap, which self-heals as the book grows and
         # should stay quiet -- from an oversized or buggy order (one unit fits, this order does not),
         # which is a genuine fat-finger the guard exists to shout about. Marking every size reject
         # deferrable would log a real sizing bug at INFO and miss it.
