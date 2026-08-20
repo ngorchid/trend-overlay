@@ -110,6 +110,10 @@ expect("FLIP-SMALLER 5 ZN (long +4 -> -1, |exposure| shrinks) is allowed",
        check_order("ZN", "SELL", 5, 108.0, 1000.0, F, current_position_notional=4 * _ZN), True)
 expect("GROW +4 ZN (long +4 -> +8) is rejected (increases exposure)",
        check_order("ZN", "BUY", 4, 108.0, 1000.0, F, current_position_notional=4 * _ZN), False)
+expect("rates reject IS deferrable (one ZN alone > the order cap -> instrument too big, self-heals)",
+       Check(check_order("ZN", "BUY", 4, 108.0, 1000.0, F).deferrable), True)
+expect("a FAT-FINGER oversize is NOT deferrable (one AAPL fits -> stays a loud WARNING)",
+       Check(not check_order("AAPL", "BUY", 3000, 305.0, 1.0, L).deferrable), True)
 print("  -- options: 100x multiplier --")
 O = RiskLimits.for_options(100_000.0)
 expect("2 SPY spreads @ $4.40 x 100", check_order("SPY", "SELL", 2, 4.40, 100.0, O), True)

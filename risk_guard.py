@@ -288,23 +288,26 @@ def check_order(ticker: str, side: str, qty: float, price: float, multiplier: fl
     # `safety` flag; this also covers ordinary reduces and roll-outs.)
     grows = after > abs(current_position_notional) + 1e-6
     if grows:
-        # deferrable=True: these fire when an instrument is simply too big for the CURRENT budget
-        # (e.g. a full-size treasury on a small book). That is expected and self-heals as the book
-        # grows, so the caller logs it quietly rather than as a daily alert.
+        # "deferrable" separates a reject caused by the INSTRUMENT being too big for the CURRENT
+        # budget -- even ONE contract exceeds the order cap, which self-heals as the book grows and
+        # should stay quiet -- from an oversized or buggy order (one unit fits, this order does not),
+        # which is a genuine fat-finger the guard exists to shout about. Marking every size reject
+        # deferrable would log a real sizing bug at INFO and miss it.
+        deferrable = abs(price * multiplier) > limits.max_order_frac * limits.budget
         if notional > limits.max_order_frac * limits.budget:
             return Check(False, f"{ticker}: order ${notional:,.0f} = "
                                 f"{notional/limits.budget:.0%} of budget, over the "
-                                f"{limits.max_order_frac:.0%} single-order cap", deferrable=True)
+                                f"{limits.max_order_frac:.0%} single-order cap", deferrable=deferrable)
         if after > limits.max_position_frac * limits.budget:
             return Check(False, f"{ticker}: position would reach ${after:,.0f} = "
                                 f"{after/limits.budget:.0%} of budget, over the "
-                                f"{limits.max_position_frac:.0%} per-instrument cap", deferrable=True)
+                                f"{limits.max_position_frac:.0%} per-instrument cap", deferrable=deferrable)
         gcap = limits.max_gross_frac if max_gross_frac is None else max_gross_frac
         if gross_notional + notional > gcap * limits.budget:
             return Check(False, f"{ticker}: gross would reach "
                                 f"${gross_notional + notional:,.0f} = "
                                 f"{(gross_notional+notional)/limits.budget:.1f}x budget, over the "
-                                f"{gcap:.1f}x cap", deferrable=True)
+                                f"{gcap:.1f}x cap", deferrable=deferrable)
 
     if reference_price is not None and np.isfinite(reference_price) and reference_price > 0:
         dev = abs(price / reference_price - 1.0)
