@@ -83,6 +83,52 @@ class TrendState:
                                "reason": reason})
         return realized
 
+    def resync_to_broker(self, actual: dict[str, tuple[float, float]], date: str = "",
+                         mult_by_market: dict[str, float] | None = None) -> list[str]:
+        """Snap the P&L ledger to IB, the SOURCE OF TRUTH for positions.
+
+        `actual` is {market: (signed_qty, avg_price_points)} from broker.portfolio_marks. The
+        ledger drifts from the broker whenever a broker position changes without a recorded fill
+        — an uncaptured fill price (record_fill is skipped when no price comes back), a run that
+        traded but did not save, or a manual edit — and it cannot self-correct because it only
+        ever moves by NEW recorded fills. The reconcile step only REPORTED the gap (e.g. the
+        recurring "PHANTOM rates_10y"); this actually closes it, snapping each drifted market to
+        the broker's signed quantity and adopting the broker's own average cost as the go-forward
+        basis, so future closes book correct P&L.
+
+        It does NOT invent realised P&L for the unrecorded change: that fill price is unknowable,
+        and fabricating one would corrupt realized_pnl worse than a known gap does. So
+        realized_pnl is left untouched and every correction is written to the trade_log for audit.
+
+        Trading reads positions from IB directly every run, so this only ever fixes bookkeeping —
+        it never places or implies a trade. Idempotent: a market already in sync is skipped, so
+        it is safe to call every run.
+        """
+        mult_by_market = mult_by_market or {}
+        notes: list[str] = []
+        for market in sorted(set(self.ledger) | set(actual)):
+            led = self.ledger.get(market)
+            led_qty = led.qty if led else 0.0
+            act_qty, act_avg = actual.get(market, (0.0, 0.0))
+            if int(round(led_qty)) == int(round(act_qty)):
+                continue
+            mult = (led.multiplier if led and led.multiplier else None) \
+                or mult_by_market.get(market) or 1.0
+            if int(round(act_qty)) == 0:
+                self.ledger[market] = MarketLedger(qty=0.0, avg_price=0.0, multiplier=mult)
+            else:
+                basis = float(act_avg) or (led.avg_price if led else 0.0)
+                self.ledger[market] = MarketLedger(qty=float(act_qty), avg_price=basis,
+                                                   multiplier=mult)
+            notes.append(f"{market}: ledger {led_qty:g} -> broker {act_qty:g}")
+            self.trade_log.append({
+                "date": date, "market": market, "symbol": "", "expiry": "",
+                "signed_qty": int(round(act_qty - led_qty)), "price": float(act_avg or 0.0),
+                "realized_pnl": 0.0,
+                "reason": f"RESYNC ledger to broker ({led_qty:g} -> {act_qty:g}); realised P&L for "
+                          f"the unrecorded change is not reconstructable and was NOT booked"})
+        return notes
+
     def record_snapshot(self, date: str, total_pnl: float, spy: float | None = None) -> None:
         self.nav_history = [h for h in self.nav_history if h["date"] != date]
         self.nav_history.append({"date": date, "total_pnl": round(total_pnl, 2), "spy": spy})

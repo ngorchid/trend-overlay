@@ -326,6 +326,15 @@ def main() -> None:
         _d, _rnote = reconcile(_exp, _act, label="futures ledger")
         if _rnote:
             logging.warning("%s", _rnote)
+            # AUTO-CORRECT the drift the reconcile just reported. IB is the source of truth for
+            # positions, so snap the P&L ledger to it instead of emailing the same phantom every
+            # day (rates_10y drifted for weeks this way). Bookkeeping only — never trades.
+            _actful = {p["market"]: (float(p["contracts"]), float(p["avg_price"])) for p in positions}
+            _mults = {s.market: s.multiplier for s in FUTURES}
+            _fixed = state.resync_to_broker(_actful, today, _mults)
+            if _fixed:
+                logging.warning("reconcile: auto-corrected the P&L ledger to IB -> %s",
+                                "; ".join(_fixed))
         unreal = sum(p.get("unrealized_pnl") or 0.0 for p in positions)
         spy_day, spy_incep, _ = _spy_returns(state.inception_date)
         state.record_snapshot(today, state.realized_pnl + unreal)
