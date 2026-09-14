@@ -26,12 +26,25 @@ def _table(headers, rows) -> str:
     return f"<table style='border-collapse:collapse;font-family:monospace;font-size:13px'><tr>{th}</tr>{trs}</table>"
 
 
+def _daily_pnl(state: TrendState, total_today: float, today: str) -> float | None:
+    """Change in TOTAL P&L (realized + unrealized) since the last recorded run. None on the very
+    first run (no prior snapshot). nav_history is kept date-sorted, and record_snapshot may have
+    already written today's row, so the baseline is the most recent row that is NOT today's."""
+    prev = [h for h in state.nav_history if h.get("date") != today and h.get("total_pnl") is not None]
+    return (total_today - float(prev[-1]["total_pnl"])) if prev else None
+
+
 def build_email_body(state: TrendState, positions: list[dict], todays_orders: list[dict],
                      spy_day, spy_incep, today: str) -> str:
     """positions: [{market, symbol, contracts, avg_price, mark, unrealized_pnl}]
     todays_orders: [{action, qty, symbol, expiry, reason}]"""
     unreal = sum(p.get("unrealized_pnl") or 0.0 for p in positions)
     total = state.realized_pnl + unreal
+    daily = _daily_pnl(state, total, today)
+    label = os.getenv("BOOK_LABEL", "Paper")
+    _dcolor = "#1a7f37" if (daily or 0) >= 0 else "#b91c1c"
+    _dcell = (f"<span style='color:{_dcolor}'>${daily:+,.0f}</span>" if daily is not None
+              else "<span style='color:#64748b'>— (first run)</span>")
 
     pos_rows = []
     for p in sorted(positions, key=lambda x: x["market"]):
@@ -53,21 +66,23 @@ def build_email_body(state: TrendState, positions: list[dict], todays_orders: li
 
     summary = f"""
     <table style='font-family:monospace;font-size:13px;margin:8px 0'>
-      <tr><td style='padding:2px 14px 2px 0'>Total P&amp;L (since {state.inception_date})</td><td><b>${total:+,.0f}</b></td></tr>
+      <tr><td style='padding:2px 14px 2px 0'>Daily P&amp;L (since last run)</td><td><b>{_dcell}</b></td></tr>
+      <tr><td>Total P&amp;L (since {state.inception_date})</td><td><b>${total:+,.0f}</b></td></tr>
       <tr><td>Realized</td><td>${state.realized_pnl:+,.0f}</td></tr>
       <tr><td>Unrealized</td><td>${unreal:+,.0f}</td></tr>
       <tr><td>Open positions</td><td>{sum(1 for p in positions if p['contracts'])}</td></tr>
       <tr><td style='padding-top:8px'>SPY (context)</td><td style='padding-top:8px'>today {_pct(spy_day)} &nbsp; since inception {_pct(spy_incep)}</td></tr>
     </table>"""
 
+    _foot = "Real capital." if label.upper() == "LIVE" else "Paper trading."
     return f"""<html><body style='font-family:sans-serif;color:#1e293b'>
-    <h2 style='color:#1a3c5e'>Trend Overlay Paper — {today}</h2>
+    <h2 style='color:#1a3c5e'>Trend Overlay {label} — {today}</h2>
     {summary}
     <h3 style='color:#1a3c5e'>Positions</h3>
     {pos_tbl}
     <h3 style='color:#1a3c5e'>Today's trades</h3>
     {trades_tbl}
-    <p style='color:#64748b;font-size:11px;margin-top:14px'>Cross-asset trend (7 futures markets), weekly rebalance, inverse-vol risk parity, {os.getenv('TARGET_VOL','0.10')} vol-target × {os.getenv('OVERLAY_MULT','0.5')}. Uncorrelated diversifier — SPY shown for context, not as a benchmark. Paper trading.</p>
+    <p style='color:#64748b;font-size:11px;margin-top:14px'>Cross-asset trend (7 futures markets), weekly rebalance, inverse-vol risk parity, {os.getenv('TARGET_VOL','0.10')} vol-target × {os.getenv('OVERLAY_MULT','0.5')}. Uncorrelated diversifier — SPY shown for context, not as a benchmark. {_foot}</p>
     </body></html>"""
 
 
@@ -80,7 +95,11 @@ def send_report(state: TrendState, positions: list[dict], todays_orders: list[di
         body = alerts.html() + body
     _mark = (f'[{alerts.worst} x{len(alerts.records)}] '
              if alerts is not None and getattr(alerts, 'worst', None) else '')
-    subject = _mark + f"Trend Overlay Paper — {today}: total P&L ${total:+,.0f} ({len(todays_orders)} trades)"
+    _label = os.getenv("BOOK_LABEL", "Paper")
+    _daily = _daily_pnl(state, total, today)
+    _dstr = f"day ${_daily:+,.0f}, " if _daily is not None else ""
+    subject = _mark + (f"Trend Overlay {_label} — {today}: {_dstr}total ${total:+,.0f} "
+                       f"({len(todays_orders)} trades)")
     user, pw, to = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"), os.getenv("TO_EMAIL")
     if dry_run or not all([user, pw, to]):
         if not dry_run:
