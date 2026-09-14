@@ -432,6 +432,26 @@ expect("  ... so an order merely MENTIONING safety is still guarded (no accident
              "reason text must no longer be load-bearing"))
 expect("safety_closes sets the flag on every order it emits",
        Check(all(o.safety for o in sc + sc_s), ""))
+
+# REGRESSION (2026-09-14, first live run at OVERLAY_MULT=1.5): the futures guard must be sized off
+# the EFFECTIVE budget (budget x overlay) — the same base the strategy's per-market (0.40) and
+# gross (3.0) caps use — or above overlay ~1.1 the guard's 0.45 single-order cap becomes TIGHTER
+# than the strategy and blocks legitimate orders. Live at 1.5 it rejected MES ($27.5k) and fx_aud
+# ($26.4k) that sit fine under the strategy's $30k per-market cap. Invariant: an order AT the
+# strategy's per-market cap must pass the guard when the guard is on the effective budget, and the
+# old raw-budget guard would have blocked it (so the fix demonstrably bites).
+_eff = 50_000.0 * 1.5
+_percap = 0.40 * _eff                                  # strategy per-market cap = $30,000
+_g_eff = RiskLimits.for_futures(_eff)
+_g_raw = RiskLimits.for_futures(50_000.0)
+expect("guard on the EFFECTIVE budget admits an order at the strategy per-market cap",
+       Check(_percap <= _g_eff.max_order_frac * _g_eff.budget + 1e-6,
+             f"${_percap:,.0f} vs eff cap ${_g_eff.max_order_frac * _g_eff.budget:,.0f}"))
+expect("  ... and the raw-budget guard WOULD have blocked it (the fix is not vacuous)",
+       Check(_percap > _g_raw.max_order_frac * _g_raw.budget,
+             f"${_percap:,.0f} vs raw cap ${_g_raw.max_order_frac * _g_raw.budget:,.0f}"))
+expect("guard keeps HEADROOM over the strategy cap at overlay 1.5 (0.45 > 0.40)",
+       Check(_g_eff.max_order_frac * _g_eff.budget > _percap, ""))
 expect("plan_roll_orders does NOT set it (ordinary orders stay guarded)",
        Check(not RollOrder(spec0.sym(True), far, "BUY", 1, "reconcile").safety, ""))
 

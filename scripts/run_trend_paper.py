@@ -260,7 +260,7 @@ def main() -> None:
                 # A frozen feed still yields a signal, a vol estimate and a full target book —
                 # all plausible, all wrong. price sanity cannot catch it: each price is valid,
                 # just old.
-                _lim_f = RiskLimits.for_futures(cfg.budget)
+                _lim_f = RiskLimits.for_futures(cfg.budget * cfg.overlay_multiple)
                 _fresh = data_fresh(px.index, pd.Timestamp(today), _lim_f)
                 if not _fresh:
                     logging.error("data staleness: %s — SAFETY closes only today", _fresh.reason)
@@ -300,7 +300,15 @@ def main() -> None:
                     targets = dict(held_by_mkt)
                 rolls = plan_roll_orders(targets, held_left, front, BY_MARKET, cfg.use_micro, today)
                 batches = [("SAFETY", safety), ("ROLL+RECONCILE", rolls)]
-            lim = RiskLimits.for_futures(cfg.budget)
+            # Size the guard against the EFFECTIVE budget (budget x overlay), the same base the
+            # strategy's own per-market (0.40) and gross (3.0) caps use. for_futures' 0.45/3.30
+            # fracs were chosen to backstop those WITH HEADROOM, which only holds if both use the
+            # same base. At OVERLAY_MULT > 1.1 the raw-budget guard becomes TIGHTER than the
+            # strategy and wrongly blocks legitimate orders: at 1.5 it rejected MES ($27.5k) and
+            # fx_aud ($26.4k) — 55%/53% of the RAW $50k — that sit fine under the strategy's
+            # $30k (0.40 x 75k) per-market cap. It still catches a real sizing bug (5x too big
+            # blows past 0.45 x effective too), so independence is preserved.
+            lim = RiskLimits.for_futures(cfg.budget * cfg.overlay_multiple)
             for label, batch in batches:
                 fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim, held=held)
                 for f in fills:
