@@ -251,8 +251,8 @@ expect("options-vrp coef == max_positions x risk_per_trade (6 x 3%)",
              f"{ALLOCATIONS['options-vrp'].peak_margin_coef}"))
 expect("magic-formula coef == Reg-T maintenance on long stock (25%)",
        Check(abs(ALLOCATIONS["magic-formula"].peak_margin_coef - 0.25) < 1e-9, ""))
-expect("trend coef == ~3.5% SPAN on ~3.12x notional",
-       Check(abs(ALLOCATIONS["trend-overlay"].peak_margin_coef - 0.035 * 3.12) < 0.002,
+expect("trend coef == ~3.5% SPAN on ~4.68x notional (3.12x x OVERLAY_MULT 1.5)",
+       Check(abs(ALLOCATIONS["trend-overlay"].peak_margin_coef - 0.035 * 3.12 * 1.5) < 0.002,
              f"{ALLOCATIONS['trend-overlay'].peak_margin_coef}"))
 
 # End-to-end: the shipped table must actually clear the liquidity floor it is judged against.

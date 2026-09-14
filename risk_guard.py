@@ -571,7 +571,11 @@ class Allocation:
                             `_gross_scalar` is clipped to <=1 so gross never exceeds 1.0x budget.
       options-vrp    0.18   max_positions (6) x risk_per_trade (3%). A defined-risk spread's
                             margin IS its max loss, so this is a hard ceiling, not a typical case.
-      trend-overlay  0.109  ~3.5% SPAN on ~3.12x budget of notional ($311,900 against ~$10,900).
+      trend-overlay  0.164  ~3.5% SPAN on ~4.68x budget of notional. The coef SCALES WITH
+                            OVERLAY_MULT: worst-case gross/budget is 3.12x at the 1.0 reference
+                            (0.035 x 3.12 = 0.109), so at the LIVE OVERLAY_MULT=1.5 it is
+                            3.12 x 1.5 = 4.68x -> 0.035 x 4.68 = 0.164. RE-DERIVE THIS IF
+                            OVERLAY_MULT CHANGES (it is the one coef that is not overlay-invariant).
 
     Multiply coef by fraction to get each sleeve's peak margin as a share of NAV; the sum is what
     the account must carry simultaneously.
@@ -594,8 +598,9 @@ class Allocation:
 # additive and this table is the real constraint, not a conservative one.
 #
 # Fractions of 1.0 are deliberate and are NOT "3x over-allocation": the strategies share
-# COLLATERAL rather than carving up cash, so what must be bounded is the summed MARGIN (53.9% of
-# NAV here), not the summed budget. `effective_budget`'s docstring warns against sizing off
+# COLLATERAL rather than carving up cash, so what must be bounded is the summed MARGIN (59.4% of
+# NAV here — magic 25% + trend 16.4% at OVERLAY_MULT 1.5 + options 18%, 40.6% cushion), not the
+# summed budget. `effective_budget`'s docstring warns against sizing off
 # NetLiq precisely because it was unallocated; making the fraction explicit and validating the
 # margin sum is the principled version of the same idea.
 # ⚠ SCOPE: these THREE sleeves only. Any other strategy trading the same IB account draws on the
@@ -603,7 +608,7 @@ class Allocation:
 # actually free. Add it to this table before relying on the number.
 ALLOCATIONS: dict[str, Allocation] = {
     "magic-formula": Allocation(1.00, 0.25, "Reg-T 25% of gross; gross <= 1.0x budget"),
-    "trend-overlay": Allocation(1.00, 0.109, "~3.5% SPAN on ~3.12x budget notional"),
+    "trend-overlay": Allocation(1.00, 0.164, "~3.5% SPAN on ~4.68x budget notional at OVERLAY_MULT 1.5"),
     "options-vrp": Allocation(1.00, 0.18, "max_positions 6 x risk_per_trade 3% -- structural"),
 }
 MIN_ALLOCATION_CUSHION = 0.40
