@@ -328,7 +328,7 @@ def main() -> None:
                     if f["fill_price"]:
                         state.record_fill(f["market"], signed, f["fill_price"], f["mult"],
                                           today, f["symbol"], f["expiry"], f["reason"],
-                                          order_ref=ORDER_REF)
+                                          order_ref=ORDER_REF, exec_ids=f.get("exec_ids"))
                         todays_orders.append(f)
                     else:
                         todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})

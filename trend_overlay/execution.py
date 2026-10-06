@@ -367,6 +367,20 @@ class FuturesBroker:
         # statements, so every fill is attributable to a strategy AND the run that placed it.
         self.order_ref: str | None = None
 
+    def _exec_ids(self, trade, wait: float = 3.0) -> list[str]:
+        """IB execution ids of a filled order: the key that matches `ibExecID` in the Flex
+        records, so each trade_log entry ties to IB's own record exactly (verified 2026-10-06; the
+        permId does NOT match Flex's ibOrderID). execDetails can trail the Filled status by a
+        moment, so wait briefly for them. Never raises -- an id is evidence, not a precondition."""
+        try:
+            waited = 0.0
+            while not getattr(trade, "fills", None) and waited < wait:
+                self.ib.sleep(0.5)
+                waited += 0.5
+            return [f.execution.execId for f in (getattr(trade, "fills", None) or [])]
+        except Exception:  # noqa: BLE001
+            return []
+
     def connect(self, timeout: int = 15) -> bool:
         from ib_insync import IB
         self.ib = IB()
@@ -568,9 +582,11 @@ class FuturesBroker:
                         break
                 st = trade.orderStatus.status
                 fp = trade.orderStatus.avgFillPrice or None
-                logging.info("%s %d %s %s -> %s%s  (%s)", o.action, o.qty, o.ib_symbol, o.expiry,
-                             st, f" @ {fp}" if fp else "", o.reason)
-                fills.append({**base, "fill_price": float(fp) if fp else None, "status": st})
+                ex = self._exec_ids(trade) if st == "Filled" else []
+                logging.info("%s %d %s %s -> %s%s  (%s)  exec %s", o.action, o.qty, o.ib_symbol,
+                             o.expiry, st, f" @ {fp}" if fp else "", o.reason, ",".join(ex) or "-")
+                fills.append({**base, "fill_price": float(fp) if fp else None, "status": st,
+                              "exec_ids": ex})
             except Exception as e:  # noqa: BLE001
                 logging.error("order failed %s %s %s: %s", o.action, o.ib_symbol, o.expiry, e)
                 fills.append({**base, "fill_price": None, "status": "error"})
