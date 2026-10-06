@@ -281,10 +281,15 @@ def main() -> None:
                 batches = [("SAFETY", safety)]
             else:
                 # Current holdings, so hysteresis can hold a position whose target sits inside
-                # the band. Keyed by MARKET (held_left is per contract-month); summed because a
+                # the band. Keyed by MARKET (held is per contract-month); summed because a
                 # market can straddle two expiries mid-roll.
+                # Built from `held`, NOT `held_left`: a safety close is a ROLL, not an exit. Using
+                # held_left made a force-closed market look flat, so re-entry needed |target| >=
+                # band instead of the hold threshold -- on 2026-10-05 oil (signal +1.00, target
+                # 0.70 ct) was closed for expiry and never re-bought. Orders still come from
+                # held_left below, so the front contract is bought back up to target.
                 held_by_mkt: dict[str, int] = {}
-                for h in held_left:
+                for h in held:
                     m = next((s_.market for s_ in FUTURES
                               if s_.sym(cfg.use_micro) == h.ib_symbol), None)
                     if m:
