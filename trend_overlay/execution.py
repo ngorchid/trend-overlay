@@ -362,6 +362,10 @@ class FuturesBroker:
         self.host, self.port, self.client_id, self.dry_run = host, port, client_id, dry_run
         self.ib = None
         self._front: dict[str, object] = {}
+        # Stamped on every order as IB's orderRef ("<strategy>:<run id>"), set by the runner.
+        # The account is shared by several sleeves; IB carries orderRef into executions and Flex
+        # statements, so every fill is attributable to a strategy AND the run that placed it.
+        self.order_ref: str | None = None
 
     def connect(self, timeout: int = 15) -> bool:
         from ib_insync import IB
@@ -550,6 +554,8 @@ class FuturesBroker:
                     logging.warning("could not qualify %s %s — skipped", o.ib_symbol, o.expiry); continue
                 order = MarketOrder(o.action, o.qty)
                 order.tif = "DAY"          # explicit — trims the preset TIF cancel/resubmit (Error 10349)
+                if getattr(self, "order_ref", None):    # a missing tag must never stop an order
+                    order.orderRef = self.order_ref
                 trade = self.ib.placeOrder(q[0], order)
                 # Poll up to `wait`s, returning as soon as the order reaches a terminal state. A
                 # single fixed sleep read the status while still PreSubmitted, so the email showed

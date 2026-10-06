@@ -53,6 +53,11 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 ALERTS = install_alert_collector()
 STATE_FILE = ROOT / "results" / "paper" / "state.json"
 
+# One id per run, stamped on every order as orderRef "trend-overlay:<RUN_ID>" — so each fill in
+# IB's executions and Flex statements traces back to this sleeve AND to this run's log section.
+RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
+ORDER_REF = f"trend-overlay:{RUN_ID}"
+
 # Annualised vol prior for the circuit-breaker levels, from the contract-level backtest
 # (algo_trading/scripts/breaker_calibration_lab.py, live config at OVERLAY_MULT 1.0): 12.4%.
 # ⚠ THIS IS THE POST-CHANGE FIGURE. OVERLAY_MULT went 0.5 -> 1.0 on 2026-08-13, doubling
@@ -184,6 +189,8 @@ def main() -> None:
     is_trade_day = not args.safety_only
 
     broker = FuturesBroker(port=args.port, client_id=args.client_id, dry_run=False)
+    broker.order_ref = ORDER_REF
+    logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
         logging.error("IB connect failed — aborting."); return
     state = TrendState.load(STATE_FILE); state.ensure_inception(today)
@@ -320,7 +327,8 @@ def main() -> None:
                     signed = f["qty"] if f["action"] == "BUY" else -f["qty"]
                     if f["fill_price"]:
                         state.record_fill(f["market"], signed, f["fill_price"], f["mult"],
-                                          today, f["symbol"], f["expiry"], f["reason"])
+                                          today, f["symbol"], f["expiry"], f["reason"],
+                                          order_ref=ORDER_REF)
                         todays_orders.append(f)
                     else:
                         todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})

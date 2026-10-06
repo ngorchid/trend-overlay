@@ -51,7 +51,8 @@ class TrendState:
 
     # ---- fills: average-cost realized-P&L accounting ----
     def record_fill(self, market: str, signed_qty: int, price: float, multiplier: float,
-                    date: str, symbol: str = "", expiry: str = "", reason: str = "") -> float:
+                    date: str, symbol: str = "", expiry: str = "", reason: str = "",
+                    order_ref: str = "") -> float:
         """Record a fill (signed_qty: + buy, - sell). Books realized P&L when the trade
         reduces or flips the existing position. Returns the realized P&L of this fill."""
         led = self.ledger.get(market) or MarketLedger(multiplier=multiplier)
@@ -80,7 +81,7 @@ class TrendState:
 
         self.trade_log.append({"date": date, "market": market, "symbol": symbol, "expiry": expiry,
                                "signed_qty": signed_qty, "price": price, "realized_pnl": round(realized, 2),
-                               "reason": reason})
+                               "reason": reason, "order_ref": order_ref})
         return realized
 
     def resync_to_broker(self, actual: dict[str, tuple[float, float]], date: str = "",
