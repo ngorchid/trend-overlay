@@ -586,7 +586,7 @@ class FuturesBroker:
                 logging.info("%s %d %s %s -> %s%s  (%s)  exec %s", o.action, o.qty, o.ib_symbol,
                              o.expiry, st, f" @ {fp}" if fp else "", o.reason, ",".join(ex) or "-")
                 fills.append({**base, "fill_price": float(fp) if fp else None, "status": st,
-                              "exec_ids": ex})
+                              "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""})
             except Exception as e:  # noqa: BLE001
                 logging.error("order failed %s %s %s: %s", o.action, o.ib_symbol, o.expiry, e)
                 fills.append({**base, "fill_price": None, "status": "error"})

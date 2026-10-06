@@ -58,6 +58,31 @@ STATE_FILE = ROOT / "results" / "paper" / "state.json"
 RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
 ORDER_REF = f"trend-overlay:{RUN_ID}"
 
+
+def make_broker(**kw) -> FuturesBroker:
+    """The run's broker, tagged with this run's ORDER_REF. A factory rather than two inline lines
+    so the tagging is testable: scripts/test_order_links.py asserts main() builds its broker here
+    and that the tag is set, because a runner that forgets it sends every order out untagged
+    while the broker-level tests stay green."""
+    b = FuturesBroker(**kw)
+    b.order_ref = ORDER_REF
+    return b
+
+
+def book_fills(state: TrendState, fills: list[dict], today: str, todays_orders: list[dict]) -> None:
+    """Book each FILLED order into the ledger with its link to IB's records, and list every order
+    (filled or not) for the email. Booking records the tag the ORDER actually carried, not the
+    run's ORDER_REF, so the ledger can never claim a tag IB did not receive."""
+    for f in fills:
+        signed = f["qty"] if f["action"] == "BUY" else -f["qty"]
+        if f["fill_price"]:
+            state.record_fill(f["market"], signed, f["fill_price"], f["mult"],
+                              today, f["symbol"], f["expiry"], f["reason"],
+                              order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"))
+            todays_orders.append(f)
+        else:
+            todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})
+
 # Annualised vol prior for the circuit-breaker levels, from the contract-level backtest
 # (algo_trading/scripts/breaker_calibration_lab.py, live config at OVERLAY_MULT 1.0): 12.4%.
 # ⚠ THIS IS THE POST-CHANGE FIGURE. OVERLAY_MULT went 0.5 -> 1.0 on 2026-08-13, doubling
@@ -188,8 +213,7 @@ def main() -> None:
     # Variant D: rebalance every weekday (daily). --safety-only still restricts to the safety leg.
     is_trade_day = not args.safety_only
 
-    broker = FuturesBroker(port=args.port, client_id=args.client_id, dry_run=False)
-    broker.order_ref = ORDER_REF
+    broker = make_broker(port=args.port, client_id=args.client_id, dry_run=False)
     logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
         logging.error("IB connect failed — aborting."); return
@@ -323,15 +347,7 @@ def main() -> None:
             lim = RiskLimits.for_futures(cfg.budget * cfg.overlay_multiple)
             for label, batch in batches:
                 fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim, held=held)
-                for f in fills:
-                    signed = f["qty"] if f["action"] == "BUY" else -f["qty"]
-                    if f["fill_price"]:
-                        state.record_fill(f["market"], signed, f["fill_price"], f["mult"],
-                                          today, f["symbol"], f["expiry"], f["reason"],
-                                          order_ref=ORDER_REF, exec_ids=f.get("exec_ids"))
-                        todays_orders.append(f)
-                    else:
-                        todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})
+                book_fills(state, fills, today, todays_orders)
 
         # Let IB's portfolio/position feed catch up with THIS run's fills before we read it. The
         # feed lags a fill by a second or two, so reading immediately can show a just-traded

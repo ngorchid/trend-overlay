@@ -99,6 +99,43 @@ row = st.trade_log[-1]
 check("trade_log keeps the orderRef", row.get("order_ref") == REF, str(row))
 check("trade_log keeps the execution ids", row.get("exec_ids") == ["0001.1.01"], str(row))
 
+check("a fill carries the tag its ORDER actually had", fills[0].get("order_ref") == REF, str(fills))
+check("...and an untagged order's fill says so (never claims a tag IB did not get)",
+      r and r[0].get("order_ref") == "", str(r))
+
+# ---------------------------------------------------------------------------------------------
+# RUNNER WIRING. Everything above hands the broker its tag by hand, so it cannot see the runner
+# forgetting to: deleting that one line in run_trend_paper.py sent every order out untagged
+# while all of the above stayed green. These pin the runner's own wiring.
+print("\nRUNNER WIRING")
+import inspect  # noqa: E402
+import re  # noqa: E402
+
+sys.path.insert(0, str(ROOT / "scripts"))
+import run_trend_paper as runner  # noqa: E402
+
+check("ORDER_REF is 'trend-overlay:<YYYYmmdd-HHMMSS>'",
+      re.fullmatch(r"trend-overlay:\d{8}-\d{6}", runner.ORDER_REF) is not None, runner.ORDER_REF)
+check("make_broker tags the broker with this run's ORDER_REF",
+      runner.make_broker(dry_run=True).order_ref == runner.ORDER_REF, "")
+_src = inspect.getsource(runner.main)
+check("main() builds its broker through make_broker, never FuturesBroker() directly",
+      "make_broker(" in _src and "FuturesBroker(" not in _src, "")
+check("main() books fills through book_fills", "book_fills(" in _src, "")
+
+print("\nRUNNER BOOKING -> trade_log")
+_st2, _orders = TrendState(), []
+_unfilled = {**fills[0], "fill_price": None, "status": "Submitted", "exec_ids": []}
+runner.book_fills(_st2, [fills[0], _unfilled], "2026-10-06", _orders)
+check("book_fills writes the order's orderRef into trade_log",
+      len(_st2.trade_log) == 1 and _st2.trade_log[-1].get("order_ref") == REF, str(_st2.trade_log))
+check("...and its execution ids",
+      len(_st2.trade_log) == 1 and _st2.trade_log[-1].get("exec_ids") == ["0001.1.01"],
+      str(_st2.trade_log))
+check("an unfilled order is listed for the email but NOT booked",
+      len(_orders) == 2 and len(_st2.trade_log) == 1, f"{len(_orders)} listed, "
+      f"{len(_st2.trade_log)} booked")
+
 print("\n" + "=" * 88)
 if _fails:
     print(f"{len(_fails)} FAILURE(S) of {_ran}:")
