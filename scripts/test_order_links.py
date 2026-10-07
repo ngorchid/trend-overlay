@@ -39,18 +39,21 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 class FakeIB:
     """Fills every order at once; `fills_after` sleeps before the execDetails arrive."""
 
-    def __init__(self, fills_after: int = 0):
+    def __init__(self, fills_after: int = 0, reports: bool = True):
         self.sent, self.n, self.fills_after, self._pending = [], 0, fills_after, None
+        self.reports = reports
 
     def qualifyContracts(self, *cs):
         for c in cs:
-            c.conId = 1
+            c.conId = 661016519
         return list(cs)
 
     def placeOrder(self, contract, order):
         self.n += 1
         self.sent.append(order)
-        fills = [NS(execution=NS(execId=f"0001.{self.n}.01"))]
+        fills = [NS(execution=NS(execId=f"0001.{self.n}.01"),
+                    commissionReport=NS(execId=f"0001.{self.n}.01" if self.reports else "",
+                                        commission=0.62))]
         t = NS(order=order, fills=[] if self.fills_after else fills,
                orderStatus=NS(status="Filled", avgFillPrice=88.48, filled=order.totalQuantity))
         self._pending = [t, fills, self.fills_after]
@@ -123,17 +126,37 @@ check("main() builds its broker through make_broker, never FuturesBroker() direc
       "make_broker(" in _src and "FuturesBroker(" not in _src, "")
 check("main() books fills through book_fills", "book_fills(" in _src, "")
 
+print("\nCONID / COMMISSION / CURRENCY (additive, 2026-10-07)")
+check("a fill carries conid, commission and currency",
+      fills[0].get("conid") == 661016519 and fills[0].get("commission") == 0.62
+      and fills[0].get("currency") == "USD", str(fills))
+nr = run(FakeIB(reports=False))
+check("commission reports that never arrive -> None, and the fill is still Filled",
+      nr[0].get("status") == "Filled" and nr[0].get("commission") is None, str(nr))
+
 print("\nRUNNER BOOKING -> trade_log")
 _st2, _orders = TrendState(), []
 _unfilled = {**fills[0], "fill_price": None, "status": "Submitted", "exec_ids": []}
-runner.book_fills(_st2, [fills[0], _unfilled], "2026-10-06", _orders)
+try:
+    runner.book_fills(_st2, [fills[0], _unfilled], "2026-10-06", _orders)
+except Exception as e:  # noqa: BLE001 -- a crash is a FAILED check here, not a test crash
+    _orders.append({"crashed": f"{type(e).__name__}: {e}"})
 check("book_fills writes the order's orderRef into trade_log",
       len(_st2.trade_log) == 1 and _st2.trade_log[-1].get("order_ref") == REF, str(_st2.trade_log))
 check("...and its execution ids",
       len(_st2.trade_log) == 1 and _st2.trade_log[-1].get("exec_ids") == ["0001.1.01"],
       str(_st2.trade_log))
+check("book_fills writes conid, commission and currency into trade_log",
+      len(_st2.trade_log) == 1 and _st2.trade_log[-1].get("conid") == 661016519
+      and _st2.trade_log[-1].get("commission") == 0.62 and _st2.trade_log[-1].get("currency") == "USD",
+      str(_st2.trade_log))
+_old = TrendState()
+_old.record_fill("oil", 1, 88.0, 100, "2026-10-06")
+check("a fill recorded without the new fields still records (conid 0, commission None)",
+      _old.trade_log[-1].get("conid") == 0 and _old.trade_log[-1].get("commission") is None,
+      str(_old.trade_log))
 check("an unfilled order is listed for the email but NOT booked",
-      len(_orders) == 2 and len(_st2.trade_log) == 1, f"{len(_orders)} listed, "
+      len(_orders) == 2 and len(_st2.trade_log) == 1 and not any("crashed" in o for o in _orders), f"{len(_orders)} listed, "
       f"{len(_st2.trade_log)} booked")
 
 print("\n" + "=" * 88)

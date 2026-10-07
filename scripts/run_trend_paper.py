@@ -78,7 +78,9 @@ def book_fills(state: TrendState, fills: list[dict], today: str, todays_orders: 
         if f["fill_price"]:
             state.record_fill(f["market"], signed, f["fill_price"], f["mult"],
                               today, f["symbol"], f["expiry"], f["reason"],
-                              order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"))
+                              order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"),
+                              conid=f.get("conid") or 0, commission=f.get("commission"),
+                              currency=f.get("currency") or "")
             todays_orders.append(f)
         else:
             todays_orders.append({**f, "reason": f["reason"] + f" ({f['status']})"})

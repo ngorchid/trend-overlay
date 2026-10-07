@@ -1,34 +1,16 @@
-"""Mutation-test `scripts/test_order_links.py`: seed real faults, demand the suite catches them.
+"""Mutation-test `scripts/test_order_links.py`: the order -> IB record links (orderRef, execution ids, conid, commission, currency).
 
-WHY. The order -> IB-record links (orderRef tag, execution ids) fail SILENTLY: an untagged order
-still fills, a dropped execution id still books. The first version of test_order_links.py handed
-the broker its tag and the ledger its ids by hand, so deleting the runner's one tagging line, or
-dropping the ids on the way into the ledger, survived with the suite green (measured 2026-10-06).
-A passing suite is only evidence if breaking each link on purpose makes it fail.
-
-Never edits the real files: the repo's code (no data, results, .env or .git) is copied to a temp
-dir once and each mutant is written there, so an interrupted run cannot leave a broken file for
-the scheduled task.
-
-Non-zero exit if any fault survives, a pattern no longer matches exactly once (the code moved:
-update this file), or a mutant does not compile (it would be "caught" by the SyntaxError alone).
+Seeds real faults into a TEMP COPY of the repo (the real files are never edited) and demands the
+suite catches every one. Engine: _mutate_repo_core.py.
 
 Run: python scripts/mutate_order_links.py
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-SUITE = [sys.executable, "scripts/test_order_links.py"]
-IGNORE = shutil.ignore_patterns(".git", "data", "results", "__pycache__", ".idea", ".claude",
-                                ".env", ".venv", "venv", "*.parquet", "*.pkl")
+from _mutate_repo_core import run
 
-# (file, find, replace, what the fault means)
 MUTATIONS = [
     ('trend_overlay/execution.py',
      '                    order.orderRef = self.order_ref\n',
@@ -43,12 +25,12 @@ MUTATIONS = [
      'while not getattr(trade, "fills", None) and waited < 0:',
      "no wait for execution details that trail 'Filled'"),
     ('trend_overlay/execution.py',
-     '"exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""})',
-     '"exec_ids": [], "order_ref": getattr(order, "orderRef", "") or ""})',
+     '"exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or "",\n                              "conid"',
+     '"exec_ids": [], "order_ref": getattr(order, "orderRef", "") or "",\n                              "conid"',
      'a fill drops its execution ids'),
     ('trend_overlay/execution.py',
-     '"exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""})',
-     '"exec_ids": ex, "order_ref": "trend-overlay:CLAIMED"})',
+     '"exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or "",\n                              "conid"',
+     '"exec_ids": ex, "order_ref": "trend-overlay:CLAIMED",\n                              "conid"',
      'a fill claims a tag the order did not carry'),
     ('scripts/run_trend_paper.py',
      '    b.order_ref = ORDER_REF\n',
@@ -63,12 +45,12 @@ MUTATIONS = [
      'ORDER_REF = f"trend:{RUN_ID}"',
      'RUNNER: tag names the wrong strategy'),
     ('scripts/run_trend_paper.py',
-     'order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"))',
-     'order_ref="", exec_ids=f.get("exec_ids"))',
+     'order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"),',
+     'order_ref="", exec_ids=f.get("exec_ids"),',
      'RUNNER: booking drops the orderRef'),
     ('scripts/run_trend_paper.py',
-     'order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"))',
-     'order_ref=f.get("order_ref", ""), exec_ids=None)',
+     'order_ref=f.get("order_ref", ""), exec_ids=f.get("exec_ids"),',
+     'order_ref=f.get("order_ref", ""), exec_ids=None,',
      'RUNNER: booking drops the execution ids'),
     ('scripts/run_trend_paper.py',
      '        if f["fill_price"]:\n            state.record_fill(',
@@ -79,65 +61,30 @@ MUTATIONS = [
      '',
      'RUNNER: main() stops booking fills'),
     ('trend_overlay/state.py',
-     '"exec_ids": list(exec_ids or [])})',
-     '"exec_ids": []})',
+     '"exec_ids": list(exec_ids or []),   # = Flex ibExecID',
+     '"exec_ids": [],   # = Flex ibExecID',
      'trade_log drops the execution ids'),
+    ('trend_overlay/execution.py',
+     '                              "commission": self._commission(trade) if st == "Filled" else None,',
+     '                              "commission": None,',
+     'commission never recorded'),
+    ('trend_overlay/execution.py',
+     '                              "conid": int(getattr(q[0], "conId", 0) or 0),',
+     '                              "conid": 0,',
+     'conid never recorded'),
+    ('trend_overlay/execution.py',
+     '                if fills and all(r is not None and getattr(r, "execId", "") for r in reps):',
+     '                if fills:',
+     'commission reports counted before IB sent them'),
+    ('trend_overlay/state.py',
+     '                               "conid": int(conid or 0), "commission": commission,',
+     '                               "conid": 0, "commission": None,',
+     'trade_log drops conid and commission'),
+    ('scripts/run_trend_paper.py',
+     '                              conid=f.get("conid") or 0, commission=f.get("commission"),',
+     '                              conid=0, commission=None,',
+     'runner booking drops conid and commission'),
 ]
 
-
-def main() -> int:
-    base = subprocess.run(SUITE, cwd=ROOT, capture_output=True, text=True)
-    if base.returncode != 0:
-        print("the suite does not pass on the ORIGINAL code — fix that first")
-        print(base.stdout[-2000:])
-        return 1
-    print("=" * 100)
-    print(f"  {len(MUTATIONS)} seeded faults; every one must be CAUGHT\n")
-    results = []
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp) / "repo"
-        shutil.copytree(ROOT, work, ignore=IGNORE)
-        for rel, find, repl, why in MUTATIONS:
-            f = work / rel
-            orig = f.read_text(encoding="utf-8")
-            n = orig.count(find)
-            if n != 1:
-                results.append((why, None))
-                print(f"  [ ?? ] {why:80} PATTERN {'MISSING' if n == 0 else f'AMBIGUOUS x{n}'}")
-                continue
-            mutant = orig.replace(find, repl, 1)
-            try:                    # a mutant that does not even compile is not a test of anything
-                compile(mutant, rel, "exec")
-            except SyntaxError as e:
-                results.append((why, None))
-                print(f"  [ ?? ] {why:80} INVALID MUTANT ({e.msg})")
-                continue
-            f.write_text(mutant, encoding="utf-8")
-            try:
-                r = subprocess.run(SUITE, cwd=work, capture_output=True, text=True)
-            finally:
-                f.write_text(orig, encoding="utf-8")
-            caught = r.returncode != 0
-            results.append((why, caught))
-            print(f"  [{'ok  ' if caught else 'FAIL'}] {why:80} "
-                  f"{'CAUGHT' if caught else '*** SURVIVED ***'}")
-    survived = [w for w, c in results if c is False]
-    missing = [w for w, c in results if c is None]
-    print("\n" + "=" * 100)
-    if missing:
-        print(f"{len(missing)} mutation(s) could not be applied (pattern moved or mutant invalid) "
-              "— update this file:")
-        for w in missing:
-            print("   " + w)
-    if survived:
-        print(f"{len(survived)} MUTATION(S) SURVIVED — those cases cannot fail and are decoration:")
-        for w in survived:
-            print("   " + w)
-    if survived or missing:
-        return 1
-    print(f"all {len(MUTATIONS)} seeded faults were caught; the real files were never modified")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run("test_order_links.py", MUTATIONS))

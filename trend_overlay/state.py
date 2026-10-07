@@ -52,7 +52,8 @@ class TrendState:
     # ---- fills: average-cost realized-P&L accounting ----
     def record_fill(self, market: str, signed_qty: int, price: float, multiplier: float,
                     date: str, symbol: str = "", expiry: str = "", reason: str = "",
-                    order_ref: str = "", exec_ids: list[str] | None = None) -> float:
+                    order_ref: str = "", exec_ids: list[str] | None = None,
+                    conid: int = 0, commission: float | None = None, currency: str = "") -> float:
         """Record a fill (signed_qty: + buy, - sell). Books realized P&L when the trade
         reduces or flips the existing position. Returns the realized P&L of this fill."""
         led = self.ledger.get(market) or MarketLedger(multiplier=multiplier)
@@ -82,7 +83,10 @@ class TrendState:
         self.trade_log.append({"date": date, "market": market, "symbol": symbol, "expiry": expiry,
                                "signed_qty": signed_qty, "price": price, "realized_pnl": round(realized, 2),
                                "reason": reason, "order_ref": order_ref,
-                               "exec_ids": list(exec_ids or [])})   # = Flex ibExecID
+                               "exec_ids": list(exec_ids or []),   # = Flex ibExecID
+                               # additive (2026-10-07): IB contract id, commission, currency
+                               "conid": int(conid or 0), "commission": commission,
+                               "currency": currency})
         return realized
 
     def resync_to_broker(self, actual: dict[str, tuple[float, float]], date: str = "",

@@ -367,6 +367,25 @@ class FuturesBroker:
         # statements, so every fill is attributable to a strategy AND the run that placed it.
         self.order_ref: str | None = None
 
+    def _commission(self, trade, wait: float = 3.0) -> float | None:
+        """Total IB commission of a filled order, from the commission reports that follow the
+        executions (2026-10-07). A report counts only once IB has sent it (its execId is set).
+        None when they have not all arrived -- a missing value is recorded as missing and never
+        holds up or blocks the trade."""
+        try:
+            waited = 0.0
+            while True:
+                fills = list(getattr(trade, "fills", None) or [])
+                reps = [getattr(f, "commissionReport", None) for f in fills]
+                if fills and all(r is not None and getattr(r, "execId", "") for r in reps):
+                    return round(sum(float(r.commission) for r in reps), 4)
+                if waited >= wait:
+                    return None
+                self.ib.sleep(0.5)
+                waited += 0.5
+        except Exception:  # noqa: BLE001
+            return None
+
     def _exec_ids(self, trade, wait: float = 3.0) -> list[str]:
         """IB execution ids of a filled order: the key that matches `ibExecID` in the Flex
         records, so each trade_log entry ties to IB's own record exactly (verified 2026-10-06; the
@@ -586,7 +605,10 @@ class FuturesBroker:
                 logging.info("%s %d %s %s -> %s%s  (%s)  exec %s", o.action, o.qty, o.ib_symbol,
                              o.expiry, st, f" @ {fp}" if fp else "", o.reason, ",".join(ex) or "-")
                 fills.append({**base, "fill_price": float(fp) if fp else None, "status": st,
-                              "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or ""})
+                              "exec_ids": ex, "order_ref": getattr(order, "orderRef", "") or "",
+                              "conid": int(getattr(q[0], "conId", 0) or 0),
+                              "commission": self._commission(trade) if st == "Filled" else None,
+                              "currency": getattr(q[0], "currency", "") or spec.currency})
             except Exception as e:  # noqa: BLE001
                 logging.error("order failed %s %s %s: %s", o.action, o.ib_symbol, o.expiry, e)
                 fills.append({**base, "fill_price": None, "status": "error"})
