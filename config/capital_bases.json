@@ -1,0 +1,23 @@
+{
+  "_doc": "SINGLE source for each live sleeve's SIZING budget and its RETURN base (owner's decision, 2026-10-07). `budget` (and trend's `overlay_mult`) is what the runner sizes with, read via risk_guard.documented_sizing; `amount` is the return denominator. NOT capital allocations: the sleeves share one account's collateral, so the amounts overlap and do not sum to NAV. risk_guard.ALLOCATIONS are guard CEILINGS, never a source of budgets. Change a value ONLY together with a dated row in docs/capital_bases.md, in its own commit; this file is kept byte-identical in algo_trading, trend-overlay and options-vrp.",
+  "magic-formula": {
+    "amount": 50000,
+    "budget": 50000,
+    "effective": "2026-08-17",
+    "represents": "inception NAV: the account's funded size when magic-formula went live (read from its state.json inception_nav; this figure documents it)",
+    "sizing": "budget CAPS the deployment base: sizing is gap-to-NAV against min(NAV, budget), so the sleeve deploys up to 50k and never compounds past it; amount (inception NAV) is the return base only"
+  },
+  "trend-overlay": {
+    "amount": 75000,
+    "budget": 50000,
+    "overlay_mult": 1.5,
+    "effective": "2026-09-14",
+    "represents": "notional sizing budget: BUDGET 50,000 x OVERLAY_MULT 1.5"
+  },
+  "options-vrp": {
+    "amount": 50000,
+    "budget": 50000,
+    "effective": "2026-10-04",
+    "represents": "BUDGET: the risk base that sizes each spread (3% max loss per position)"
+  }
+}

@@ -152,6 +152,59 @@ def halt_state(root: Path | str) -> tuple[str, str]:
     return HALT_NONE, ""
 
 
+# ---------------------------------------------------------------- documented sizing budgets
+def documented_sizing(root: Path | str, sleeve: str, key: str = "budget",
+                      env_var: str = "BUDGET") -> tuple[float, str]:
+    """(value, source) of one sizing input -- `budget` or (trend) `overlay_mult` -- from
+    config/capital_bases.json, the SINGLE source for sizing budgets and return bases (owner's
+    decision, 2026-10-07; docs/capital_bases.md). ALLOCATIONS stays a set of guard CEILINGS and no
+    budget is derived from it.
+
+    An env override (BUDGET / OVERLAY_MULT) is still honoured for a deliberate one-off, but when it
+    DIFFERS from the documented value it is announced as a WARNING -- which reaches the email -- so
+    a stray override can never silently diverge from the documented base. A missing or unreadable
+    config is an ERROR and falls back to the env value, else to the nominal allocation (the live
+    values when this was written) -- never to zero, which for the trend overlay would mean
+    closing every position."""
+    raw = os.getenv(env_var)
+    env_val = float(raw) if raw not in (None, "") else None
+    try:
+        entry = json.loads((Path(root) / "config" / "capital_bases.json").read_text())[sleeve]
+        doc = float(entry[key])
+    except Exception as e:  # noqa: BLE001
+        fallback = (env_val if env_val is not None else
+                    (ALLOCATIONS[sleeve].fraction * NOMINAL_NAV if key == "budget" else 1.0))
+        logging.error("sizing: config/capital_bases.json unreadable for %s.%s (%s) — using %s",
+                      sleeve, key, e, fallback)
+        return float(fallback), f"FALLBACK ({type(e).__name__})"
+    if env_val is not None and abs(env_val - doc) > 1e-9:
+        logging.warning("sizing: %s env override %g DIFFERS from the documented %s.%s = %g "
+                        "(config/capital_bases.json) — using the override; record it in "
+                        "docs/capital_bases.md or remove it", env_var, env_val, sleeve, key, doc)
+        return env_val, f"env {env_var} override (documented {doc:g})"
+    return doc, "config/capital_bases.json" + (f" (env {env_var} agrees)" if env_val is not None else "")
+
+
+def log_sizing(sleeve: str, budget: float, source: str, net_liq: float | None = None,
+               overlay: float | None = None, overlay_source: str = "") -> str:
+    """The startup line that shows the budget ACTUALLY in use, and its source, so a stray env
+    override cannot diverge from the documented base unseen. Also checks the budget against the
+    sleeve's ALLOCATIONS ceiling x NAV (NetLiq when known, else NOMINAL_NAV) and WARNS above it --
+    a ceiling, not a source: nothing is sized from it."""
+    eff = budget * (overlay if overlay is not None else 1.0)
+    line = (f"sizing: {sleeve} budget in use ${budget:,.0f} [{source}]"
+            + (f" x OVERLAY_MULT {overlay:g} [{overlay_source}] = ${eff:,.0f} effective"
+               if overlay is not None else ""))
+    logging.info("%s", line)
+    alloc = ALLOCATIONS.get(sleeve)
+    nav = net_liq if (net_liq and net_liq > 0) else NOMINAL_NAV
+    if alloc is not None and budget > alloc.fraction * nav + 1e-6:
+        logging.warning("sizing: %s budget $%s exceeds its ALLOCATIONS ceiling %.0f%% x NAV $%s = $%s",
+                        sleeve, f"{budget:,.0f}", 100 * alloc.fraction, f"{nav:,.0f}",
+                        f"{alloc.fraction * nav:,.0f}")
+    return line
+
+
 def halted(root: Path | str, limits: RiskLimits | None = None) -> Check:
     """Back-compat wrapper: False (not ok) when ANY halt is in force."""
     mode, why = halt_state(root)

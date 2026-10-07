@@ -35,7 +35,7 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
-from risk_guard import (NOMINAL_NAV, RiskLimits, allocated_budget,  # noqa: E402
+from risk_guard import (RiskLimits, documented_sizing, log_sizing,  # noqa: E402
                         code_version,
                         stale_columns,
                         check_allocations,
@@ -150,29 +150,21 @@ def _cfg(state: TrendState | None = None, unrealized: float = 0.0) -> TrendPaper
     validated risk: the backtest (Sharpe 0.74, maxDD -20%) is at 1.0, so 0.5 realised ~5% vol
     against a 10% target, for roughly half the expected return.
     """
-    # This sleeve's SHARE of the live account, from the validated table in
-    # risk_guard.ALLOCATIONS. The old hard-coded $100,000 sat alongside magic-formula's $50k and
-    # options-vrp's $75k -- three independently-set budgets on one $50k account, summing to 74%
-    # of NAV in maintenance. Peak margin here is ~3.5% SPAN on ~3.12x budget of notional.
-    # BUDGET in .env still overrides for a deliberate one-off.
+    # Budget AND overlay multiple come from config/capital_bases.json, the single source for
+    # sizing (owner's decision, 2026-10-07); an env BUDGET / OVERLAY_MULT still overrides for a
+    # one-off but is WARNED about when it differs. risk_guard.ALLOCATIONS stays a set of guard
+    # ceilings (checked below and in log_sizing), never a source of budgets.
     _alloc_ok = check_allocations()
     if not _alloc_ok:
         logging.error("ALLOCATION: %s", _alloc_ok.reason)
-    _override = os.getenv("BUDGET")
-    if _override:
-        budget = float(_override)
-        logging.info("budget: $%s from BUDGET override — allocation table BYPASSED",
-                     f"{budget:,.0f}")
-    else:
-        budget, note = allocated_budget("trend-overlay",
-                                        getattr(state, "last_net_liq", 0.0) or None,
-                                        float(os.getenv("NOMINAL_NAV", str(NOMINAL_NAV))),
-                                        step=float(os.getenv("BUDGET_STEP", "0.10")))
-        logging.info("budget: %s", note)
+    budget, bsrc = documented_sizing(ROOT, "trend-overlay")
+    om, osrc = documented_sizing(ROOT, "trend-overlay", key="overlay_mult", env_var="OVERLAY_MULT")
+    log_sizing("trend-overlay", budget, bsrc, getattr(state, "last_net_liq", 0.0) or None,
+               overlay=om, overlay_source=osrc)
     return TrendPaperConfig(
         budget=budget,
         target_vol=float(os.getenv("TARGET_VOL", "0.10")),
-        overlay_multiple=float(os.getenv("OVERLAY_MULT", "1.0")))
+        overlay_multiple=om)
 
 
 def _dry_book(cfg) -> None:
@@ -263,7 +255,7 @@ def main() -> None:
         # the later read at reporting time reflects POST-trade state and must stay separate.
         _pre = broker.portfolio_marks(FUTURES)
         _unreal = sum(p.get("unrealized_pnl") or 0.0 for p in _pre)
-        _base = float(os.getenv("BUDGET", "100000"))
+        _base = cfg.budget              # the documented budget (was a second, separate env read)
         _eq = _base + state.realized_pnl + _unreal
         _peak = max(peak_equity(state.nav_history, _base, key="total_pnl"), _eq)
         write_equity(ROOT.parent, "trend-overlay", _eq, _peak)
