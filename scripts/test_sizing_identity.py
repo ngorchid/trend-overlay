@@ -50,14 +50,48 @@ def fingerprint(env: dict) -> str:
 
 
 before = (Path(__file__).parent / "fixtures" / "sizing_fingerprint_2026-10-07.json").read_text().strip()
-print("BYTE-IDENTICAL SIZING, BEFORE vs AFTER")
+
+
+def same(a: str, b: str, rel: float = 1e-9) -> bool:
+    """Equal in every discrete value (config, contracts, strikes, share counts, order lists) and in
+    every float to `rel` relative precision. Exact byte equality is machine-dependent: the live PC
+    (Windows) and the Mac differ in the last digits of floating-point results (found 2026-10-07,
+    e.g. a credit of 0.27703538746578005 vs ...893), while every sizing decision is identical."""
+    def eq(x, y):
+        if isinstance(x, str) and isinstance(y, str) and x[:1] in "{[" and y[:1] in "{[":
+            try:
+                return eq(json.loads(x), json.loads(y))
+            except ValueError:
+                return x == y
+        if isinstance(x, float) or isinstance(y, float):
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                return False
+            return abs(x - y) <= rel * max(1.0, abs(x), abs(y))
+        if isinstance(x, dict) and isinstance(y, dict):
+            return x.keys() == y.keys() and all(eq(x[k], y[k]) for k in x)
+        if isinstance(x, list) and isinstance(y, list):
+            return len(x) == len(y) and all(eq(i, j) for i, j in zip(x, y))
+        return x == y
+    try:
+        return eq(json.loads(a), json.loads(b))
+    except ValueError:
+        return False
+print("IDENTICAL SIZING, BEFORE vs AFTER (discrete values exact, floats to 1e-9 relative)")
+check("the comparison treats last-digit float noise as equal (0.27703538746578005 vs ...893)",
+      same('{"c": 0.27703538746578005, "n": 8}', '{"c": 0.27703538746578893, "n": 8}'), "")
+check("float noise inside a NESTED JSON string (trend's targets) also counts as equal",
+      same('{"t": "{\\"x\\": 0.27703538746578005}"}', '{"t": "{\\"x\\": 0.27703538746578893}"}'), "")
+check("...but NOT a real change: a float moved by 1e-6, or a different contract count",
+      not same('{"c": 0.277035, "n": 8}', '{"c": 0.277036, "n": 8}')
+      and not same('{"c": 0.27, "n": 8}', '{"c": 0.27, "n": 9}')
+      and not same('{"t": "{\\"x\\": 2}"}', '{"t": "{\\"x\\": 3}"}'), "")
 fp_cfg = fingerprint({})
-check("from the config alone (no env override) == the pre-change output", fp_cfg == before,
+check("from the config alone (no env override) == the pre-change output", same(fp_cfg, before),
       fp_cfg[:300])
 fp_env = fingerprint({"BUDGET": "50000", "OVERLAY_MULT": "1.5"})
-check("with the live env override (agreeing) == the pre-change output", fp_env == before, fp_env[:300])
+check("with the live env override (agreeing) == the pre-change output", same(fp_env, before), fp_env[:300])
 fp_bad = fingerprint({"BUDGET": "60000"})
-check("...and the comparison CAN fail: a different budget changes the fingerprint", fp_bad != before
+check("...and the comparison CAN fail: a different budget changes the fingerprint", not same(fp_bad, before)
       and not fp_bad.startswith("FAILED"), fp_bad[:200])
 
 print("\nONE HOME EACH: config = sizing, ALLOCATIONS = ceiling")
