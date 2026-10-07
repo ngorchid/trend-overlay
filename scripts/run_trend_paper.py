@@ -39,7 +39,7 @@ from risk_guard import (RiskLimits, documented_sizing, log_sizing, HALT_HARD,  #
                         code_version,
                         stale_columns,
                         check_allocations,
-                        install_alert_collector, missed_runs, push_if_alerts,
+                        install_alert_collector, missed_runs, push_if_alerts, email_if_alerts,
                         reconcile, halt_state, HALT_ALL, HALT_NEW,
                         circuit_breaker, peak_equity, liquidity_check, MarginLimits,
                         data_fresh, write_equity, book_drawdown, book_vol,
@@ -230,6 +230,7 @@ def main() -> None:
     if _halt == HALT_HARD:
         logging.error("HALTED (hard): %s — exiting without connecting. NOTE: delivery/roll safety "
                       "closes did NOT run.", _hwhy)
+        email_if_alerts(ALERTS, "Trend Overlay HALT_HARD", datetime.now().strftime("%Y-%m-%d"))
         push_if_alerts(ALERTS, "Trend Overlay")
         return
     halt_all = _halt == HALT_ALL
@@ -252,7 +253,9 @@ def main() -> None:
     broker = make_broker(port=args.port, client_id=args.client_id, dry_run=False)
     logging.info("run id %s — orders tagged orderRef=%s", RUN_ID, ORDER_REF)
     if not broker.connect():
-        logging.error("IB connect failed — aborting."); return
+        logging.error("IB connect failed — aborting.")
+        email_if_alerts(ALERTS, "Trend Overlay", today)
+        return
     state = TrendState.load(STATE_FILE); state.ensure_inception(today)
     todays_orders: list[dict] = []
     try:

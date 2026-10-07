@@ -990,6 +990,44 @@ def push_alert(title: str, message: str, api_key: str | None = None) -> bool:
         return False
 
 
+def email_if_alerts(collector, subject_prefix: str, today: str = "", prefer: str = "") -> bool:
+    """Email the collected WARNING+ records, if any. Returns True if it was sent. NEVER raises.
+
+    WHY (2026-10-07): the halt paths (HALT_ALL / HALT_HARD) and a crashed run never reach a
+    sleeve's daily report, and they only called push_if_alerts -- which does nothing when
+    PUSHBULLET_API_KEY is unset (the live machine has none). So under a forgotten halt an open
+    assigned position would have alerted NOWHERE. This sends a plain alert email on those paths.
+
+    The subject carries the worst level, the count and one line: the first record containing
+    `prefer` (e.g. "ASSIGNED") if any, else the first ERROR, else the first record."""
+    import smtplib
+    from email.mime.text import MIMEText
+    recs = list(getattr(collector, "records", None) or [])
+    if not recs:
+        return False
+    pick = next((m for _, m in recs if prefer and prefer in m), None) or \
+        next((m for lv, m in recs if lv in ("ERROR", "CRITICAL")), None) or recs[0][1]
+    label = os.getenv("BOOK_LABEL", "paper")
+    subject = (f"[{collector.worst} x{len(recs)}] {subject_prefix} {label}"
+               + (f" — {today}" if today else "") + f": {pick[:110]}")
+    body = (collector.html() if hasattr(collector, "html") else "") or \
+        "<pre>" + "\n".join(f"[{lv}] {m}" for lv, m in recs) + "</pre>"
+    user, pw, to = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"), os.getenv("TO_EMAIL")
+    if not (user and pw and to):
+        logging.getLogger(__name__).info("alert email skipped (EMAIL_* unset)")
+        return False
+    try:
+        msg = MIMEText(f"<html><body style='font-family:sans-serif'>{body}</body></html>", "html")
+        msg["Subject"], msg["From"], msg["To"] = subject, user, to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as srv:
+            srv.login(user, pw)
+            srv.sendmail(user, [to], msg.as_string())
+        return True
+    except Exception as e:  # noqa: BLE001 -- an alert failure must never break the run
+        logging.getLogger(__name__).info("alert email failed: %s", e)
+        return False
+
+
 def push_if_alerts(collector, subject_prefix: str, api_key: str | None = None) -> bool:
     """Push the collected alerts, if any. Call AFTER the email attempt, so an email failure is
     itself included in what gets pushed."""
