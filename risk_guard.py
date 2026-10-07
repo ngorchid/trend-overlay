@@ -908,6 +908,15 @@ def missed_runs(history, today: str, date_key: str = "date") -> tuple[int, str |
 
 
 # ---------------------------------------------------------------- deployed code version
+_CODE_VERSION_NOTE = ""
+
+
+def code_version_note() -> str:
+    """The note of this process's last code_version() call ("" if it never ran), for the reports:
+    the commit a run used belongs in its email, not only in the log (2026-10-07)."""
+    return _CODE_VERSION_NOTE
+
+
 def code_version(root: Path | str, upstream: str = "origin/master", warn_behind: int = 5,
                  fetch: bool = True, timeout: float = 15.0) -> tuple[str, int | None]:
     """(note, commits_behind) — which commit is actually running, and how stale it is.
@@ -929,6 +938,7 @@ def code_version(root: Path | str, upstream: str = "origin/master", warn_behind:
     channel gets ignored — the failure this whole module keeps guarding against.
     """
     import subprocess
+    global _CODE_VERSION_NOTE
 
     def _git(*args, t=5.0):
         try:
@@ -940,7 +950,8 @@ def code_version(root: Path | str, upstream: str = "origin/master", warn_behind:
 
     sha = _git("rev-parse", "--short", "HEAD")
     if sha is None:
-        return "code version unknown (not a git checkout)", None
+        _CODE_VERSION_NOTE = "code version unknown (not a git checkout)"
+        return _CODE_VERSION_NOTE, None
     branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "?"
     if fetch:
         _git("fetch", "--quiet", *upstream.split("/", 1), t=timeout)
@@ -950,8 +961,10 @@ def code_version(root: Path | str, upstream: str = "origin/master", warn_behind:
     except ValueError:
         behind = None
     if behind is None:
-        return f"running {sha} ({branch}) — cannot compare to {upstream}", None
+        _CODE_VERSION_NOTE = f"running {sha} ({branch}) — cannot compare to {upstream}"
+        return _CODE_VERSION_NOTE, None
     note = f"running {sha} ({branch}) — {behind} commit(s) behind {upstream}"
+    _CODE_VERSION_NOTE = note
     if behind >= warn_behind:
         logging.warning("CODE IS STALE: %s — merge master into this branch and redeploy", note)
     else:
@@ -960,6 +973,23 @@ def code_version(root: Path | str, upstream: str = "origin/master", warn_behind:
 
 
 # ---------------------------------------------------------------- out-of-band alerting
+import smtplib as _smtplib
+
+
+def _test_run() -> bool:
+    """True when the process is a test or mutation run (scripts/test_*.py, scripts/mutate_*.py).
+
+    The dev box's .env holds a real PUSHBULLET_API_KEY and EMAIL_* settings, and the suites drive
+    real halt / alert paths, so test runs pushed real "HALTED" notes to the owner's phone and
+    mailed real "HALTED" alerts (2026-10-07). Live
+    entry points (run_*.py, book_summary.py, download_ib_records.py) are never named like this."""
+    import __main__
+    # The __main__ module's file, not sys.argv[0]: tests rewrite sys.argv to drive a runner's
+    # main() ("run_options_paper.py --live"), which must not switch the guard off.
+    name = Path(getattr(__main__, "__file__", "") or "").name
+    return name.startswith(("test_", "mutate_"))
+
+
 def push_alert(title: str, message: str, api_key: str | None = None) -> bool:
     """Send a Pushbullet note. Returns True if it went out. NEVER raises.
 
@@ -980,6 +1010,9 @@ def push_alert(title: str, message: str, api_key: str | None = None) -> bool:
     """
     key = api_key or os.getenv("PUSHBULLET_API_KEY")
     if not key:
+        return False
+    if _test_run():
+        logging.getLogger(__name__).info("push suppressed (test run): %s", title[:80])
         return False
     try:
         from pushbullet import Pushbullet
@@ -1010,11 +1043,17 @@ def email_if_alerts(collector, subject_prefix: str, today: str = "", prefer: str
     label = os.getenv("BOOK_LABEL", "paper")
     subject = (f"[{collector.worst} x{len(recs)}] {subject_prefix} {label}"
                + (f" — {today}" if today else "") + f": {pick[:110]}")
-    body = (collector.html() if hasattr(collector, "html") else "") or \
-        "<pre>" + "\n".join(f"[{lv}] {m}" for lv, m in recs) + "</pre>"
+    body = ((collector.html() if hasattr(collector, "html") else "") or
+            "<pre>" + "\n".join(f"[{lv}] {m}" for lv, m in recs) + "</pre>") + \
+        f"<p style='color:#64748b;font-size:11px'>Code: {_CODE_VERSION_NOTE or 'version not recorded'}</p>"
     user, pw, to = os.getenv("EMAIL_USER"), os.getenv("EMAIL_PASS"), os.getenv("TO_EMAIL")
     if not (user and pw and to):
         logging.getLogger(__name__).info("alert email skipped (EMAIL_* unset)")
+        return False
+    if _test_run() and getattr(_smtplib.SMTP_SSL, "__module__", "") == "smtplib":
+        # A test driving a real halt path with the dev box's .env would mail the owner a real
+        # "HALTED" alert (it did, 2026-10-07). Tests that fake SMTP still exercise the send.
+        logging.getLogger(__name__).info("alert email suppressed (test run, real SMTP)")
         return False
     try:
         msg = MIMEText(f"<html><body style='font-family:sans-serif'>{body}</body></html>", "html")

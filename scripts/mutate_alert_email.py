@@ -12,6 +12,14 @@ import sys
 from _mutate_repo_core import run
 
 MUTATIONS = [
+    ("risk_guard.py", '    if _test_run() and getattr(_smtplib.SMTP_SSL, "__module__", "") == "smtplib":',
+     "    if False:", "test runs mail real HALTED alerts again"),
+    ("risk_guard.py", '    if _test_run() and getattr(_smtplib.SMTP_SSL, "__module__", "") == "smtplib":',
+     "    if _test_run():", "test runs can no longer exercise the email send with a fake server"),
+    ("risk_guard.py", "    if _test_run():\n", "    if False:\n",
+     "test runs push real Pushbullet notes again"),
+    ("risk_guard.py", '    return name.startswith(("test_", "mutate_"))', '    return name.startswith("test_")',
+     "mutation runs push real Pushbullet notes"),
     ('risk_guard.py',
      '    if not recs:\n        return False\n    pick',
      '    if True:\n        return False\n    pick',

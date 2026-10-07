@@ -98,6 +98,66 @@ r = safe(runner.main)
 check("a failed connection -> alert email (no report would otherwise go out)",
       r is None and len(SENT) == 1 and "IB connect failed" in SENT[0][0], str((r, [s for s, _ in SENT])))
 
+
+print("\nNO PHONE PUSH FROM A TEST RUN (the dev box's .env has a real key)")
+import types as _types  # noqa: E402
+_PUSHED: list[str] = []
+_fake_pb = _types.ModuleType("pushbullet")
+_fake_pb.Pushbullet = lambda key: _types.SimpleNamespace(push_note=lambda t, m: _PUSHED.append(t))
+sys.modules["pushbullet"] = _fake_pb
+import __main__ as _main  # noqa: E402
+_argv0 = _main.__file__
+_main.__file__ = "scripts/test_alert_email.py"
+check("under a test script, push_alert with a key sends NOTHING",
+      rg.push_alert("t", "m", api_key="k") is False and _PUSHED == [], str(_PUSHED))
+_main.__file__ = "scripts/mutate_alert_email.py"
+check("...nor under a mutation runner", rg.push_alert("t", "m", api_key="k") is False and _PUSHED == [],
+      str(_PUSHED))
+_main.__file__ = "scripts/run_live_entry.py"
+check("a live entry point with a key DOES push (the guard is name-based, not a blanket off)",
+      rg.push_alert("t", "m", api_key="k") is True and _PUSHED == ["t"], str(_PUSHED))
+_main.__file__ = _argv0
+
+print("\nNO REAL ALERT EMAIL FROM A TEST RUN")
+_MAILED: list[str] = []
+
+
+class _RealLooking:                       # stands in for smtplib.SMTP_SSL: same module name
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def login(self, u, p):
+        pass
+
+    def sendmail(self, frm, to, raw):
+        _MAILED.append(raw)
+
+
+_RealLooking.__module__ = "smtplib"
+_saved_smtp = smtplib.SMTP_SSL
+smtplib.SMTP_SSL = _RealLooking
+os.environ.update(EMAIL_USER="u@x", EMAIL_PASS="p", TO_EMAIL="t@x")
+_c = type("C", (), {"records": [("ERROR", "HALTED (hard): x")], "worst": "ERROR"})()
+_main.__file__ = "scripts/test_alert_email.py"
+check("under a test script, with the REAL smtplib class, email_if_alerts sends nothing",
+      rg.email_if_alerts(_c, "T") is False and _MAILED == [], str(len(_MAILED)))
+_main.__file__ = "scripts/run_live_entry.py"
+sys.argv = ["run_options_paper.py", "--live"]
+_main.__file__ = _argv0
+check("a test that rewrites sys.argv to drive main() is STILL treated as a test (no real mail)",
+      rg.email_if_alerts(_c, "T") is False and _MAILED == [], str(len(_MAILED)))
+_main.__file__ = "scripts/run_live_entry.py"
+check("a live entry point sends it (the guard is name-based)", rg.email_if_alerts(_c, "T") is True
+      and len(_MAILED) == 1, str(len(_MAILED)))
+_main.__file__ = _argv0
+smtplib.SMTP_SSL = _saved_smtp
+
 print("\n" + "=" * 88)
 if _fails:
     print(f"{len(_fails)} FAILURE(S) of {_ran}:")

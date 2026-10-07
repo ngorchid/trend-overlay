@@ -16,6 +16,17 @@ from email.mime.text import MIMEText
 from .state import TrendState
 
 
+
+def _code_line() -> str:
+    """The commit this run used (risk_guard.code_version), as the report's last line."""
+    try:
+        from risk_guard import code_version_note
+        note = code_version_note()
+    except Exception:  # noqa: BLE001 -- reporting must never break the run
+        note = ""
+    return (f"<p style='color:#64748b;font-size:11px'>Code: "
+            f"{note or 'version not recorded'}</p>")
+
 def _pct(x) -> str:
     return "—" if x is None else f"{x*100:+.2f}%"
 
@@ -83,6 +94,7 @@ def build_email_body(state: TrendState, positions: list[dict], todays_orders: li
     <h3 style='color:#1a3c5e'>Today's trades</h3>
     {trades_tbl}
     <p style='color:#64748b;font-size:11px;margin-top:14px'>Cross-asset trend (7 futures markets), weekly rebalance, inverse-vol risk parity, {os.getenv('TARGET_VOL','0.10')} vol-target × {os.getenv('OVERLAY_MULT','0.5')}. Uncorrelated diversifier — SPY shown for context, not as a benchmark. {_foot}</p>
+    {_code_line()}
     </body></html>"""
 
 
