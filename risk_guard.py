@@ -114,29 +114,35 @@ class RiskLimits:
 
 
 # ---------------------------------------------------------------- kill switch
-HALT_NONE, HALT_NEW, HALT_ALL = "none", "new_risk", "all"
+HALT_NONE, HALT_NEW, HALT_ALL, HALT_HARD = "none", "new_risk", "all", "hard"
 
 
 def halt_state(root: Path | str) -> tuple[str, str]:
-    """(mode, reason). Modes: none | new_risk | all.
+    """(mode, reason). Modes: none | new_risk | all | hard.
 
-    TWO FILES, deliberately, because "stop trading" has two meanings and conflating them is
-    dangerous:
+    THREE FILES, deliberately, because "stop trading" has three meanings and conflating them is
+    dangerous (levels split 2026-10-07; the invariant is that nothing blocks a risk-REDUCING close
+    except a deliberate hard stop):
 
       HALT      -> NEW_RISK. Open nothing new; keep MANAGING what is already on — profit targets,
                    time stops, rolls and delivery closes all still run. This is the one you want
                    almost always: "something looks wrong, stop adding until I have looked."
-      HALT_ALL  -> ALL. The run exits immediately having done nothing.
-                   ⚠ THIS ALSO BLOCKS DELIVERY CLOSES. A physically-delivered contract (ZB, ZN,
-                   SIL) left past its notice date goes to DELIVERY. Only use it when you can watch
-                   the account, and clear it before any notice date.
+      HALT_ALL  -> ALL. No new risk and no normal management. ONLY closes that are SAFETY-flagged,
+                   deterministic and strictly risk-reducing still run: the options-vrp assignment
+                   unwind, and the trend overlay's delivery/safety closes and same-size rolls.
+                   Sleeves without such closes (magic-formula, substitute-pairs) do nothing.
+      HALT_HARD -> HARD. No IB connection at all; nothing runs, nothing is unwound. Set it only
+                   when you suspect the system ITSELF is misbehaving.
+                   ⚠ THIS ALSO BLOCKS DELIVERY CLOSES AND THE ASSIGNMENT UNWIND. A physically-
+                   delivered contract (ZB, ZN, SIL) left past its notice date goes to DELIVERY; an
+                   assigned put's stock stays on. Only use it when you can watch the account.
 
     A FILE rather than an env var so it can be dropped in from a phone via a synced folder,
     without touching the scheduler, the code, or a remote session. Whatever text the file contains
     is echoed into the alert, so leave yourself a note about why.
     """
     r = Path(root)
-    for name, mode in ((r / "HALT_ALL", HALT_ALL), (r / "HALT", HALT_NEW)):
+    for name, mode in ((r / "HALT_HARD", HALT_HARD), (r / "HALT_ALL", HALT_ALL), (r / "HALT", HALT_NEW)):
         if name.exists():
             note = ""
             try:
@@ -145,6 +151,8 @@ def halt_state(root: Path | str) -> tuple[str, str]:
                 pass
             return mode, f"{name.name} present" + (f": {note}" if note else "")
     env = os.getenv("TRADING_HALT", "").strip().lower()
+    if env in ("hard", "3"):
+        return HALT_HARD, "TRADING_HALT=hard"
     if env in ("all", "2"):
         return HALT_ALL, "TRADING_HALT=all"
     if env in ("1", "true", "yes", "new", "new_risk"):

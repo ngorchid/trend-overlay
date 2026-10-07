@@ -35,7 +35,7 @@ from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
     compute_targets, plan_roll_orders, safety_closes,
 )
-from risk_guard import (RiskLimits, documented_sizing, log_sizing,  # noqa: E402
+from risk_guard import (RiskLimits, documented_sizing, log_sizing, HALT_HARD,  # noqa: E402
                         code_version,
                         stale_columns,
                         check_allocations,
@@ -81,6 +81,27 @@ def warn_non_usd_contracts(futures=None) -> list[str]:
         logging.warning("NON-USD trend contract(s): %s — its cash would be charged to magic-formula "
                         "by the IB-records attribution; re-decide that rule", ", ".join(bad))
     return bad
+
+
+def held_by_market(held, use_micro: bool) -> dict[str, int]:
+    """Signed contracts held per MARKET (held is per contract-month; summed because a market can
+    straddle two expiries mid-roll). Built from ALL holdings, safety-closed ones included: a
+    safety close is a ROLL, not an exit (the 2026-10-05 oil fix)."""
+    out: dict[str, int] = {}
+    for h in held:
+        m = next((s_.market for s_ in FUTURES if s_.sym(use_micro) == h.ib_symbol), None)
+        if m:
+            out[m] = out.get(m, 0) + int(h.qty)
+    return out
+
+
+def halt_all_batches(held, held_left, safety, front, use_micro: bool, today: str) -> list:
+    """HALT_ALL (2026-10-07): the SAFETY closes plus ROLLS at the SAME size -- targets are exactly
+    what is held, so plan_roll_orders only moves a position out of a near-expiry contract into the
+    front month. Deterministic (no prices, no signal), opens no new exposure, resizes nothing."""
+    rolls = plan_roll_orders(held_by_market(held, use_micro), held_left, front, BY_MARKET,
+                             use_micro, today)
+    return [("SAFETY", safety), ("ROLL (HALT_ALL)", rolls)]
 
 
 def book_fills(state: TrendState, fills: list[dict], today: str, todays_orders: list[dict]) -> None:
@@ -195,7 +216,9 @@ def main() -> None:
     # gains and therefore UNDER-sizes after a run-up. Conservative, and the right way to be wrong.
     cfg = _cfg(TrendState.load(STATE_FILE))
 
-    # KILL SWITCH. HALT_ALL exits before connecting; HALT freezes exposure but still ROLLS —
+    # KILL SWITCH (levels split 2026-10-07). HALT_HARD exits before connecting. HALT_ALL runs
+    # ONLY the SAFETY closes and same-size rolls (deterministic, no price feed, no new exposure).
+    # HALT freezes exposure but still ROLLS —
     # a physically-delivered contract (ZB, ZN, SIL) left past its notice date goes to DELIVERY,
     # so a halt that blocks rolls is more dangerous than the situation prompting it.
     # Report WHICH COMMIT is running before anything else. Placed above the kill switch so it
@@ -204,11 +227,15 @@ def main() -> None:
     code_version(ROOT)
     warn_non_usd_contracts()
     _halt, _hwhy = halt_state(ROOT)
-    if _halt == HALT_ALL:
-        logging.error("HALTED (all): %s — exiting without trading. NOTE: delivery/roll safety "
+    if _halt == HALT_HARD:
+        logging.error("HALTED (hard): %s — exiting without connecting. NOTE: delivery/roll safety "
                       "closes did NOT run.", _hwhy)
         push_if_alerts(ALERTS, "Trend Overlay")
         return
+    halt_all = _halt == HALT_ALL
+    if halt_all:
+        logging.error("HALTED (all): %s — SAFETY closes and same-size rolls ONLY; nothing opened, "
+                      "resized or closed for the signal", _hwhy)
 
     if args.selftest:
         _selftest(); return
@@ -294,7 +321,7 @@ def main() -> None:
             # Target leg needs FRESH prices; SAFETY closes never do and must always run,
             # or a physically-delivered contract drifts toward delivery.
             _fresh = None
-            if not args.safety_only:
+            if not args.safety_only and not halt_all:   # HALT_ALL needs no prices
                 start_dt = (pd.Timestamp.today() - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
                 px = download_ohlcv(PROXY_ETFS, start_dt)["adj_close"]
                 # A frozen feed still yields a signal, a vol estimate and a full target book —
@@ -317,7 +344,9 @@ def main() -> None:
                     for _c in _stale:
                         px[_c] = np.nan
 
-            if args.safety_only or not _fresh:
+            if halt_all and not args.safety_only:
+                batches = halt_all_batches(held, held_left, safety, front, cfg.use_micro, today)
+            elif args.safety_only or not _fresh:
                 batches = [("SAFETY", safety)]
             else:
                 # Current holdings, so hysteresis can hold a position whose target sits inside
@@ -328,12 +357,7 @@ def main() -> None:
                 # band instead of the hold threshold -- on 2026-10-05 oil (signal +1.00, target
                 # 0.70 ct) was closed for expiry and never re-bought. Orders still come from
                 # held_left below, so the front contract is bought back up to target.
-                held_by_mkt: dict[str, int] = {}
-                for h in held:
-                    m = next((s_.market for s_ in FUTURES
-                              if s_.sym(cfg.use_micro) == h.ib_symbol), None)
-                    if m:
-                        held_by_mkt[m] = held_by_mkt.get(m, 0) + int(h.qty)
+                held_by_mkt = held_by_market(held, cfg.use_micro)
                 tgt = compute_targets(px, cfg, held=held_by_mkt)
                 targets = {m: int(r["contracts"]) for m, r in tgt.iterrows()}
                 if _halt == HALT_NEW:
