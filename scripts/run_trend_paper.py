@@ -69,6 +69,20 @@ def make_broker(**kw) -> FuturesBroker:
     return b
 
 
+def warn_non_usd_contracts(futures=None) -> list[str]:
+    """Runtime twin of scripts/test_contract_currency.py (2026-10-07): a test only runs when
+    someone runs it, so every run also WARNS if a contract is not USD-denominated. It never stops
+    anything -- closes and rolls must stay unblockable -- it only says the IB-records attribution
+    premise (foreign cash belongs to magic-formula) no longer holds."""
+    from trend_overlay.contracts import FUTURES
+    bad = [f"{s.market} ({s.symbol}) {s.currency}"
+           for s in (FUTURES if futures is None else futures) if s.currency != "USD"]
+    if bad:
+        logging.warning("NON-USD trend contract(s): %s — its cash would be charged to magic-formula "
+                        "by the IB-records attribution; re-decide that rule", ", ".join(bad))
+    return bad
+
+
 def book_fills(state: TrendState, fills: list[dict], today: str, todays_orders: list[dict]) -> None:
     """Book each FILLED order into the ledger with its link to IB's records, and list every order
     (filled or not) for the email. Booking records the tag the ORDER actually carried, not the
@@ -196,6 +210,7 @@ def main() -> None:
     # is recorded even on a halted run: "the box is running week-old code" is exactly the kind of
     # thing you want to learn from a halted day's log, not discover a month later.
     code_version(ROOT)
+    warn_non_usd_contracts()
     _halt, _hwhy = halt_state(ROOT)
     if _halt == HALT_ALL:
         logging.error("HALTED (all): %s — exiting without trading. NOTE: delivery/roll safety "
