@@ -123,13 +123,54 @@ def _portfolio_vol(w: np.ndarray, vols: np.ndarray, rets: pd.DataFrame,
     return float(np.sqrt(var)) if var > 0 else indep
 
 
+# A price-derived contract value further than this factor from the stored approximation is refused
+# (falls back to the stored value, loudly). Real moves since the approximations were written are
+# well inside it (silver ~1.8x by 2026-09); a unit error (cents vs dollars, a wrong multiplier) is
+# 100x and is caught.
+VALUE_SANITY = 3.0
+
+
+def contract_value(spec: FutureSpec, use_micro: bool, values: dict[str, float] | None = None) -> float:
+    """$ notional of ONE contract: the price-derived value when one is given, else the stored
+    approximation in contracts.py. Used by BOTH the sizer and the order guard, so they agree."""
+    v = (values or {}).get(spec.market)
+    if v is not None and np.isfinite(v) and v > 0:
+        return float(v)
+    return spec.notional(use_micro)
+
+
+def checked_values(raw: dict[str, float], specs: list[FutureSpec],
+                   use_micro: bool) -> tuple[dict[str, float], list[str]]:
+    """Keep each market's price-derived contract value if it is usable; say why for each one that
+    is not (missing, non-positive, or more than VALUE_SANITY x away from the stored value)."""
+    out: dict[str, float] = {}
+    notes: list[str] = []
+    for s in specs:
+        stored = s.notional(use_micro)
+        v = raw.get(s.market)
+        if v is None or not np.isfinite(v) or v <= 0:
+            notes.append(f"{s.market}: no price from IB -- sized on the stored value ${stored:,.0f}")
+            continue
+        if not stored / VALUE_SANITY <= v <= stored * VALUE_SANITY:
+            notes.append(f"{s.market}: IB value ${v:,.0f} is more than {VALUE_SANITY:g}x away from "
+                         f"the stored ${stored:,.0f} -- refused, sized on the stored value")
+            continue
+        out[s.market] = float(v)
+    return out, notes
+
+
 def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
                     specs: list[FutureSpec] = FUTURES,
-                    held: dict[str, int] | None = None) -> pd.DataFrame:
+                    held: dict[str, int] | None = None,
+                    values: dict[str, float] | None = None) -> pd.DataFrame:
     """ETF-proxy price panel -> target signed contract counts per market.
 
     Returns a frame indexed by market with columns: signal, ann_vol, dollar_exposure,
     contracts, notional. Uses the *latest* row of the (blended TSMOM) signal and 60d vol.
+
+    `values` ({market -> $ per contract}, from `checked_values`) replaces the stored contract
+    approximations, which had drifted 40-80% below real (Appendix E #23). Without it the stored
+    values are used, as before.
     """
     specs = [s for s in specs if s.proxy_etf in proxy_prices.columns]
     px = proxy_prices[[s.proxy_etf for s in specs]]
@@ -171,7 +212,8 @@ def compute_targets(proxy_prices: pd.DataFrame, cfg: TrendPaperConfig,
         # why 2b was added in the first place -- and scale_clip absorbs its only other effect,
         # which was on est_vol via w. Removed rather than left as unreachable code in a sizing
         # path, where dead guards invite the assumption that something is protected.
-        rows.append((s.market, sg, vv_raw, expo, s.notional(cfg.use_micro), s.sym(cfg.use_micro)))
+        rows.append((s.market, sg, vv_raw, expo, contract_value(s, cfg.use_micro, values),
+                     s.sym(cfg.use_micro)))
     df = pd.DataFrame(rows, columns=["market", "signal", "ann_vol", "dollar_exposure", "notional", "ib_symbol"]).set_index("market")
 
     # aggregate vol-target: scale so estimated book vol ≈ target_vol, using the FULL covariance
@@ -481,6 +523,44 @@ class FuturesBroker:
                 out[s.market] = c.lastTradeDateOrContractMonth
         return out
 
+    def contract_prices(self, specs, use_micro: bool) -> dict[str, float]:
+        """{market -> current price of its contract, in points}; multiply by the multiplier for $.
+
+        Held markets take IB's portfolio mark, which needs no market-data subscription. The rest
+        take a quote on the front contract: live if the account is subscribed, otherwise delayed,
+        or the last value while the market is closed (market data type 4). A market with neither
+        is simply absent; `checked_values` then falls back to the stored value and says so."""
+        out: dict[str, float] = {}
+        if self.dry_run or self.ib is None:
+            return out
+        want = {(s.sym(use_micro), int(s.mult(use_micro))): s.market for s in specs}
+        try:
+            for it in self.ib.portfolio():
+                c = it.contract
+                try:
+                    key = (c.symbol, int(float(c.multiplier or 0)))
+                except ValueError:
+                    continue
+                p = it.marketPrice
+                if c.secType == "FUT" and key in want and p is not None and p == p and p > 0:
+                    out.setdefault(want[key], float(p))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("contract prices: portfolio read failed: %s", e)
+        pairs = [(s, self.front_future(s, use_micro)) for s in specs if s.market not in out]
+        pairs = [(s, c) for s, c in pairs if c is not None]
+        if pairs:
+            try:
+                self.ib.reqMarketDataType(4)
+                for (s, _), t in zip(pairs, self.ib.reqTickers(*[c for _, c in pairs])):
+                    p = t.marketPrice()
+                    if p is None or p != p or p <= 0:
+                        p = t.close
+                    if p is not None and p == p and p > 0:
+                        out[s.market] = float(p)
+            except Exception as e:  # noqa: BLE001
+                logging.warning("contract prices: quote request failed: %s", e)
+        return out
+
     def portfolio_marks(self, specs) -> list[dict]:
         """Per-market position marks from IB's portfolio feed (works without a market-data
         subscription): {market, symbol, contracts, avg_price(points), mark(points), unrealized_pnl}.
@@ -522,7 +602,8 @@ class FuturesBroker:
         return out
 
     def execute(self, orders: list[RollOrder], specs_by_market: dict, use_micro: bool,
-                wait: float = 20.0, limits=None, held: list[HeldPosition] | None = None) -> list[dict]:
+                wait: float = 20.0, limits=None, held: list[HeldPosition] | None = None,
+                values: dict[str, float] | None = None) -> list[dict]:
         """Place a list of RollOrders, each on its specific (symbol, expiry) contract.
         Returns fills for state accounting:
             {market, symbol, expiry, action, qty, mult, fill_price, status, reason}
@@ -551,7 +632,7 @@ class FuturesBroker:
                     "expiry": o.expiry, "action": o.action, "qty": o.qty, "mult": mult,
                     "reason": o.reason}
             if limits is not None and not getattr(o, "safety", False):
-                notl = spec.notional(use_micro) if spec else 0.0
+                notl = contract_value(spec, use_micro, values) if spec else 0.0
                 px = notl / mult if mult else 0.0
                 cur = held_now.get((o.ib_symbol, o.expiry), 0)      # signed contracts of THIS contract
                 cur_notl = cur * notl

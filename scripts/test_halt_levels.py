@@ -121,7 +121,7 @@ class FakeBroker:
     def held_positions(self, futures):
         return list(held)
 
-    def execute(self, batch, specs, micro, limits=None, held=None):
+    def execute(self, batch, specs, micro, limits=None, held=None, values=None):
         self.batches.append(list(batch))
         return []
 

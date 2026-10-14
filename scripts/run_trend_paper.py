@@ -33,7 +33,7 @@ from trend_overlay.data import download_ohlcv  # noqa: E402
 from trend_overlay.email_report import send_report  # noqa: E402
 from trend_overlay.execution import (  # noqa: E402
     FuturesBroker, HeldPosition, TrendPaperConfig,
-    compute_targets, plan_roll_orders, safety_closes,
+    checked_values, compute_targets, plan_roll_orders, safety_closes,
 )
 from risk_guard import (RiskLimits, documented_sizing, log_sizing, HALT_HARD,  # noqa: E402
                         code_version,
@@ -319,6 +319,7 @@ def main() -> None:
             front = broker.front_expiries(FUTURES, cfg.use_micro)
             held = broker.held_positions(FUTURES)
             safety = safety_closes(held, BY_MARKET, today)
+            values = None          # stored contract values unless the target leg prices them below
             done = {(o.ib_symbol, o.expiry) for o in safety}
             held_left = [h for h in held if (h.ib_symbol, h.expiry) not in done]
             # Target leg needs FRESH prices; SAFETY closes never do and must always run,
@@ -361,7 +362,21 @@ def main() -> None:
                 # 0.70 ct) was closed for expiry and never re-bought. Orders still come from
                 # held_left below, so the front contract is bought back up to target.
                 held_by_mkt = held_by_market(held, cfg.use_micro)
-                tgt = compute_targets(px, cfg, held=held_by_mkt)
+                # CONTRACT VALUES from IB prices, not the stored approximations in contracts.py,
+                # which had drifted 40-80% below real (MES ~$38k vs $27.5k stored, 2026-09): the
+                # sleeve bought more contracts than its target and broke its own $30k per-market
+                # cap in real money. Sizer and order guard take the SAME values. A market IB
+                # cannot price falls back to the stored value, with a WARNING (Appendix E #23).
+                _prices = broker.contract_prices(FUTURES, cfg.use_micro)
+                values, _vnotes = checked_values(
+                    {m: p * BY_MARKET[m].mult(cfg.use_micro) for m, p in _prices.items()},
+                    FUTURES, cfg.use_micro)
+                for _n in _vnotes:
+                    logging.warning("contract value: %s", _n)
+                if values:
+                    logging.info("contract values: %s", ", ".join(
+                        f"{m} ${v:,.0f}" for m, v in sorted(values.items())))
+                tgt = compute_targets(px, cfg, held=held_by_mkt, values=values)
                 targets = {m: int(r["contracts"]) for m, r in tgt.iterrows()}
                 if _halt == HALT_NEW:
                     # Freeze exposure at what is already held: plan_roll_orders will still roll
@@ -382,7 +397,8 @@ def main() -> None:
             # blows past 0.45 x effective too), so independence is preserved.
             lim = RiskLimits.for_futures(cfg.budget * cfg.overlay_multiple)
             for label, batch in batches:
-                fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim, held=held)
+                fills = broker.execute(batch, BY_MARKET, cfg.use_micro, limits=lim, held=held,
+                                       values=values)
                 book_fills(state, fills, today, todays_orders)
 
         # Let IB's portfolio/position feed catch up with THIS run's fills before we read it. The
