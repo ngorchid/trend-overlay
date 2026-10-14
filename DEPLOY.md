@@ -3,14 +3,20 @@
 Cross-asset trend-following futures overlay (7 markets). **Weekly** rebalance, **daily** P&L
 email. Runs on the **same IB paper account** as the magic formula but **clientId 6** (magic
 formula = 5) so both connect at once. Signals come from yfinance ETF proxies; IB is used only
-to trade and to mark positions. Bitbucket-only (private) — not published.
+to trade, to mark positions and to value each contract (price x multiplier) for sizing.
+Bitbucket-only (private) — not published.
 
 ## The strategy in one paragraph
-3/6/12-month time-series-momentum (sign) → inverse-vol risk-parity → 10% portfolio vol-target,
-scaled by `OVERLAY_MULT` (start 0.5). Budget `$100k` (tied to the magic formula). Fixed 7-market
-basket (ES/MES, ZN, GC/MGC, HG/MHG, CL/MCL, 6E/M6E, 6A/M6A) — never rotated, only long/short/resized.
-Physical-delivery safety: every non-cash market is force-closed inside a per-market notice buffer
-(all wider than the weekly gap), so a missed roll can't become a delivery obligation.
+6- and 12-month time-series momentum (sign), daily → inverse-vol risk parity → 10% portfolio
+vol target, scaled by `OVERLAY_MULT`. Budget and overlay come from `config/capital_bases.json`
+($50k x 1.5 = $75k effective). Fixed 10-market basket (ES/MES, ZN, ZB, GC/1OZ, SI micro, HG/MHG,
+CL/MCL, 6E/M6E, 6A/M6A, 6J/MJY) — never rotated, only long/short/resized; a market is held only
+when one contract fits the per-market cap. Gold trades the cash-settled 1-ounce contract (1OZ).
+Physical-delivery safety: every position is force-closed inside its contract's buffer before last
+trade, so a missed roll can't become a delivery obligation.
+
+**First run after switching gold to 1OZ:** confirm IB resolves it (the log's `contract values:`
+line lists gold, and no `front_future failed` / `contract value: gold` warning appears).
 
 ## Windows setup
 

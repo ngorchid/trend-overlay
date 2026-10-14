@@ -61,16 +61,17 @@ def safe(fn, *a, **k):
 
 
 ES = BY_MARKET["equity_us"]
-STORED_MES = ES.notional(True)              # 27,500
+STORED_MES = ES.notional(True)              # the stored approximation (refreshed 2026-10-14)
+OLD_MES = 27_500.0                          # the stale stored value before 2026-10-14
 REAL_MES = 38_000.0
 
 # =============================================================================================
 print("checked_values: WHICH PRICE-DERIVED VALUES ARE USED")
-raw = {"equity_us": REAL_MES, "gold": 43_000.0, "oil": 7_000.0 * 100,      # oil: a 100x unit error
+raw = {"equity_us": REAL_MES, "gold": 4_300.0, "oil": 7_000.0 * 100,      # oil: a 100x unit error
        "fx_aud": float("nan"), "copper": 0.0}
 vals, notes = checked_values(raw, FUTURES, True)
-check("a plausible value is kept (MES $38k, gold $43k)",
-      vals.get("equity_us") == REAL_MES and vals.get("gold") == 43_000.0, str(vals))
+check("a plausible value is kept (MES $38k, gold 1OZ $4.3k)",
+      vals.get("equity_us") == REAL_MES and vals.get("gold") == 4_300.0, str(vals))
 check("a value 100x off (a unit error) is refused, with a note naming it",
       "oil" not in vals and any("oil" in n and "refused" in n for n in notes), str(notes))
 check("NaN and zero are refused as 'no price' (not as an implausible price)",
@@ -111,16 +112,16 @@ def panel(seed=3) -> pd.DataFrame:
 PX = panel()
 CFG = TrendPaperConfig(budget=50_000, overlay_multiple=1.5)
 CAP = CFG.per_market_cap * CFG.budget * CFG.overlay_multiple          # $30,000
-base = compute_targets(PX, CFG)
+base = compute_targets(PX, CFG, values={"equity_us": OLD_MES})
 T = float(base.at["equity_us", "dollar_exposure"])
-check("precondition: the equity target buys one MES at the stored value (target >= half a contract)",
-      abs(T) >= 0.5 * STORED_MES and int(base.at["equity_us", "contracts"]) != 0,
+check("precondition: the equity target buys one MES at the old $27.5k value (target >= half a contract)",
+      abs(T) >= 0.5 * OLD_MES and int(base.at["equity_us", "contracts"]) != 0,
       f"target {T:,.0f}")
 real = compute_targets(PX, CFG, values={"equity_us": REAL_MES})
 check("with the real MES value ($38k > the $30k cap) the book holds NO MES",
       int(real.at["equity_us", "contracts"]) == 0, str(real.loc["equity_us"].to_dict()))
 check("the frame carries the value used, and notional_used is in real dollars",
-      real.at["equity_us", "notional"] == REAL_MES and base.at["equity_us", "notional"] == STORED_MES, "")
+      real.at["equity_us", "notional"] == REAL_MES and base.at["equity_us", "notional"] == OLD_MES, "")
 check("the dollar target itself does not depend on the contract value",
       np.allclose(real["dollar_exposure"].to_numpy(), base["dollar_exposure"].to_numpy(), equal_nan=True), "")
 small = abs(T) / 0.4                       # raw = 0.4 of a contract -> rounds to 0
@@ -139,9 +140,9 @@ print("\nFuturesBroker.execute: THE ORDER GUARD USES THE SAME VALUES")
 fb = FuturesBroker(dry_run=True)
 lim = RiskLimits.for_futures(CFG.budget * CFG.overlay_multiple)        # 0.50 x $75k = $37.5k / position
 order = [RollOrder("MES", "20261218", "BUY", 1, "target")]
-stored_fill = safe(fb.execute, order, BY_MARKET, True, limits=lim)
+stored_fill = safe(fb.execute, order, BY_MARKET, True, limits=lim, values={"equity_us": OLD_MES})
 real_fill = safe(fb.execute, order, BY_MARKET, True, limits=lim, values={"equity_us": REAL_MES})
-check("at the stored $27.5k one MES passes the guard (dry run)",
+check("at the old $27.5k one MES passes the guard (dry run)",
       isinstance(stored_fill, list) and stored_fill and stored_fill[0]["status"] == "dryrun", str(stored_fill))
 check("at the real $38k the guard rejects it (over the $37.5k position limit)",
       isinstance(real_fill, list) and real_fill and real_fill[0]["status"] == "RiskRejected", str(real_fill))
@@ -187,7 +188,7 @@ def broker_with(ib):
 
 
 ib = FakeIB([pf_item("MES", 5, 7600.0), pf_item("SI", 5000, 31.0)],          # held MES; a FULL SI
-            {"MGC": FakeTicker(4300.0), "MCL": FakeTicker(float("nan"), close=70.0)})
+            {"1OZ": FakeTicker(4300.0), "MCL": FakeTicker(float("nan"), close=70.0)})
 got = safe(broker_with(ib).contract_prices, FUTURES, True)
 check("a held contract is priced from IB's portfolio mark, without asking for a quote",
       isinstance(got, dict) and got.get("equity_us") == 7600.0 and "MES" not in ib.asked, str(got))
@@ -203,6 +204,43 @@ got2 = safe(broker_with(ib2).contract_prices, FUTURES, True)
 check("a failed quote request does not crash: the portfolio prices survive",
       isinstance(got2, dict) and got2 == {"equity_us": 7600.0}, str(got2))
 check("a dry-run broker asks IB for nothing", FuturesBroker(dry_run=True).contract_prices(FUTURES, True) == {}, "")
+
+# =============================================================================================
+print("\nGOLD AS THE 1-OUNCE CONTRACT (cash-settled, its own short buffer)")
+from datetime import datetime, timedelta  # noqa: E402
+from trend_overlay.execution import HeldPosition, safety_closes  # noqa: E402
+G = BY_MARKET["gold"]
+check("gold's small contract is 1OZ, 1 oz per contract", G.sym(True) == "1OZ" and G.mult(True) == 1, "")
+check("1OZ keeps a 5-day buffer, the physically-delivered GC keeps 30",
+      G.buffer_days(True) == 5 and G.buffer_days(False) == 30, f"{G.buffer_days(True)}/{G.buffer_days(False)}")
+TD = datetime.now().strftime("%Y-%m-%d")
+def d(n):
+    return (datetime.now() + timedelta(days=n)).strftime("%Y%m%d")
+sc = safety_closes([HeldPosition("gold", "1OZ", d(10), 3), HeldPosition("gold", "GC", d(10), 1)], BY_MARKET, TD)
+check("10 days from last trade: the GC position is force-closed, the 1OZ position is not",
+      [(o.ib_symbol, o.qty) for o in sc] == [("GC", 1)], str(sc))
+sc2 = safety_closes([HeldPosition("gold", "1OZ", d(4), 3)], BY_MARKET, TD)
+check("4 days from last trade the 1OZ position is force-closed too", [(o.ib_symbol, o.qty) for o in sc2] == [("1OZ", 3)], str(sc2))
+other = safety_closes([HeldPosition("silver", "SI", d(20), 1), HeldPosition("oil", "MCL", d(10), 1)], BY_MARKET, TD)
+check("markets without a separate micro buffer are unchanged (silver 30d, oil 14d)",
+      sorted(o.ib_symbol for o in other) == ["MCL", "SI"], str(other))
+
+
+class DetailsIB:
+    def reqContractDetails(self, c):
+        return [NS(contract=NS(symbol=c.symbol, lastTradeDateOrContractMonth=x)) for x in (d(10), d(70))]
+
+
+fbx = FuturesBroker(dry_run=False)
+fbx.ib = DetailsIB()
+fr = safe(fbx.front_future, G, True)
+check("the front 1OZ contract is chosen with the 5-day buffer (10 days out, not the next one)",
+      getattr(fr, "lastTradeDateOrContractMonth", None) == d(10), str(fr))
+fby = FuturesBroker(dry_run=False)
+fby.ib = DetailsIB()
+fr2 = safe(fby.front_future, G, False)
+check("...while full-size GC skips it under its 30-day buffer",
+      getattr(fr2, "lastTradeDateOrContractMonth", None) == d(70), str(fr2))
 
 # =============================================================================================
 print("\nmain(): IB PRICES REACH THE SIZER AND THE GUARD")

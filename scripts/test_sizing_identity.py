@@ -49,7 +49,11 @@ def fingerprint(env: dict) -> str:
     return r.stdout.strip() if r.returncode == 0 else f"FAILED: {r.stderr[-400:]}"
 
 
-before = (Path(__file__).parent / "fixtures" / "sizing_fingerprint_2026-10-07.json").read_text().strip()
+# Re-pinned 2026-10-14, deliberately: gold moved to the 1-ounce contract (1OZ) and the stored contract
+# values were refreshed to that day's prices. Against the 2026-10-07 fixture ONLY the contract
+# values, gold's symbol and the contract counts that follow from them changed; config, signals,
+# vols and dollar targets are identical. The 2026-10-07 file is kept for that comparison.
+before = (Path(__file__).parent / "fixtures" / "sizing_fingerprint_2026-10-14.json").read_text().strip()
 
 
 def same(a: str, b: str, rel: float = 1e-9) -> bool:

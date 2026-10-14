@@ -355,10 +355,13 @@ def safety_closes(held: list[HeldPosition], specs_by_market: dict, today) -> lis
         if spec is None or h.qty == 0:
             continue
         d = days_to_expiry(h.expiry, today)
-        if d <= spec.notice_buffer_days:
+        # The held contract's OWN buffer: gold's cash-settled 1OZ micro needs far less than GC.
+        # (Silver's micro shares the "SI" symbol, but has no separate buffer, so this is exact.)
+        buf = spec.buffer_days(h.ib_symbol == spec.micro_symbol and spec.micro_symbol != spec.symbol)
+        if d <= buf:
             out.append(RollOrder(h.ib_symbol, h.expiry, "SELL" if h.qty > 0 else "BUY",
                                  abs(int(h.qty)),
-                                 f"SAFETY force-close: {d}d to last-trade <= {spec.notice_buffer_days}d buffer",
+                                 f"SAFETY force-close: {d}d to last-trade <= {buf}d buffer",
                                  safety=True))
     return out
 
@@ -504,7 +507,7 @@ class FuturesBroker:
                       multiplier=str(int(spec.mult(use_micro))))
         try:
             details = self.ib.reqContractDetails(base)
-            cutoff = pd.Timestamp.today() + pd.Timedelta(days=spec.notice_buffer_days)
+            cutoff = pd.Timestamp.today() + pd.Timedelta(days=spec.buffer_days(use_micro))
             cands = sorted((d.contract for d in details), key=lambda c: c.lastTradeDateOrContractMonth)
             front = next((c for c in cands
                           if pd.Timestamp(c.lastTradeDateOrContractMonth) >= cutoff), None)

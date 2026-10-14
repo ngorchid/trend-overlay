@@ -100,7 +100,7 @@ MUTATIONS = [
     ("                                 safety=True))",
      "                                 safety=False))",
      "safety flag not set on forced closes (exemption silently stops applying)"),
-    ("        if d <= spec.notice_buffer_days:",
+    ("        if d <= buf:",
      "        if d <= 0:",
      "notice buffer ignored (only closes AFTER last-trade, too late)"),
     ("            out.append(RollOrder(h.ib_symbol, h.expiry, \"SELL\" if h.qty > 0 else \"BUY\",",

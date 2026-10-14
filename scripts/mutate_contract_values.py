@@ -49,6 +49,18 @@ MUTATIONS = [
      "main() does not pass the values to the order guard"),
     (R, "                for _n in _vnotes:\n                    logging.warning(\"contract value: %s\", _n)\n", "",
      "markets sized on the stored value are not reported"),
+    ("trend_overlay/contracts.py",
+     "        if use_micro and self.micro_symbol and self.micro_notice_buffer_days is not None:\n            return self.micro_notice_buffer_days\n",
+     "", "the micro's own buffer is ignored (1OZ held to within 30 days like GC)"),
+    ("trend_overlay/contracts.py", "               notice_buffer_days=30, micro_notice_buffer_days=5),",
+     "               notice_buffer_days=30, micro_notice_buffer_days=30),", "1OZ given GC's 30-day buffer"),
+    ("trend_overlay/contracts.py", '"GC", "COMEX", "USD", 100,   411_000, "1OZ", 1,    4_100,',
+     '"GC", "COMEX", "USD", 100,   411_000, "MGC", 10,   41_100,', "gold back on the 10oz micro"),
+    (E, "        buf = spec.buffer_days(h.ib_symbol == spec.micro_symbol and spec.micro_symbol != spec.symbol)",
+     "        buf = spec.notice_buffer_days", "the forced close ignores the held contract's own buffer"),
+    (E, "            cutoff = pd.Timestamp.today() + pd.Timedelta(days=spec.buffer_days(use_micro))",
+     "            cutoff = pd.Timestamp.today() + pd.Timedelta(days=spec.notice_buffer_days)",
+     "the front contract is chosen with the standard contract's buffer"),
 ]
 
 if __name__ == "__main__":

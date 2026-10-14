@@ -269,11 +269,16 @@ print("    (band 0.70 chosen on SUB-PERIOD robustness, not the full-sample peak)
 # The discriminating case needs frac(raw) BETWEEN 0.5 and the band: then round() says one
 # thing and the band says another. With frac < 0.5 (e.g. copper at 7.143) both say "7" and the
 # case cannot fail -- which is exactly why the first version of it survived mutation.
-HCFG = TrendPaperConfig(budget=250_000.0, per_market_cap=0.0, gross_cap=0.0)
-base_t = compute_targets(lo_vol, HCFG, SPECS, held=None)
-raw = (base_t["dollar_exposure"] / base_t["notional"])
-_cands = [(m, float(x)) for m, x in raw.items()
-          if 0.5 < abs(x) - np.floor(abs(x)) < HCFG.hysteresis_band]
+# The budget that produces such a fraction depends on the stored contract values (refreshed
+# 2026-10-14), so search for one instead of hard-coding it: the band logic does not depend on it.
+for HB in range(250_000, 1_000_001, 10_000):
+    HCFG = TrendPaperConfig(budget=float(HB), per_market_cap=0.0, gross_cap=0.0)
+    base_t = compute_targets(lo_vol, HCFG, SPECS, held=None)
+    raw = (base_t["dollar_exposure"] / base_t["notional"])
+    _cands = [(m, float(x)) for m, x in raw.items()
+              if 0.5 < abs(x) - np.floor(abs(x)) < HCFG.hysteresis_band]
+    if _cands:
+        break
 expect("a market exists whose target sits between round() and the band (else this proves nothing)",
        Check(len(_cands) > 0, f"fractions {[round(abs(x)%1,3) for x in raw]}"))
 mkt, r_val = _cands[0]
@@ -297,14 +302,14 @@ expect("a holding OUTSIDE the band moves to round(target)",
 expect("  ... and that is a genuine change (guard is not vacuous)",
        Check(outside != n_round, ""))
 # band 0.5 is EXACTLY round() — the null check the lab reproduces to the digit.
-null = TrendPaperConfig(budget=250_000.0, per_market_cap=0.0, gross_cap=0.0,
+null = TrendPaperConfig(budget=HCFG.budget, per_market_cap=0.0, gross_cap=0.0,
                         hysteresis_band=0.5)
 same = all(int(compute_targets(lo_vol, null, SPECS, held={m: 0 for m in base_t.index}).at[m, "contracts"])
            == int(compute_targets(lo_vol, null, SPECS, held=None).at[m, "contracts"])
            for m in base_t.index)
 expect("band 0.5 reproduces plain round() exactly (the null check)", Check(same, ""))
 expect("band 0 / held=None falls back to round()",
-       Check(int(compute_targets(lo_vol, TrendPaperConfig(budget=250_000.0, per_market_cap=0.0, gross_cap=0.0,
+       Check(int(compute_targets(lo_vol, TrendPaperConfig(budget=HCFG.budget, per_market_cap=0.0, gross_cap=0.0,
                                                  hysteresis_band=0.0),
                                  SPECS, held=held_out).at[mkt, "contracts"]) == n_round, ""))
 # FIXED 2026-08-16. This previously FLATTENED: upstream `expo = 0.0 if vv != vv` turned a NaN

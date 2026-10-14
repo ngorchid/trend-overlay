@@ -89,7 +89,7 @@ check("ROLL re-establishes EXACTLY the closed size in the front month (BUY 2 MCL
       sorted((o.ib_symbol, o.expiry, o.action, o.qty) for o in rol)
       == [("M6E", front_x, "SELL", 1), ("MCL", front_x, "BUY", 2)], str(rol))
 check("nothing for a market already in the front (fx_aud) or not held (gold): no opening order",
-      not any(o.ib_symbol in ("M6A", "MGC") for o in saf + rol), str(rol))
+      not any(o.ib_symbol in ("M6A", "1OZ", "MGC") for o in saf + rol), str(rol))
 check("HALT_ALL needs no prices: the plan takes no price panel",
       "px" not in inspect.signature(runner.halt_all_batches).parameters, "")
 

@@ -134,7 +134,7 @@ def _selftest() -> None:
     targets = {"equity_us": 4, "oil": 2, "gold": -1}
     held = [HeldPosition("equity_us", "MES", "20260619", 3),
             HeldPosition("oil", "MCL", "20260721", 2),
-            HeldPosition("gold", "MGC", "20260828", -1)]
+            HeldPosition("gold", "1OZ", "20260828", -1)]
     front = {"equity_us": "20260918", "oil": "20260820", "gold": "20260828"}
     safety = safety_closes(held, BY_MARKET, today)
     done = {(o.ib_symbol, o.expiry) for o in safety}
