@@ -22,7 +22,7 @@ line lists gold, and no `front_future failed` / `contract value: gold` warning a
 
 ```bat
 cd C:\trading
-git clone git@bitbucket-picard:picard_capital/trend-overlay.git
+git clone git@bitbucket-picard:gra_systematic/trend-overlay.git
 cd trend-overlay
 python -m venv .venv && call .venv\Scripts\activate.bat
 pip install -r requirements.txt
