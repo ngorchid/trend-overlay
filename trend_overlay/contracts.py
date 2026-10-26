@@ -53,7 +53,7 @@ class FutureSpec:
         return self.notice_buffer_days
 
 
-# Core diversified basket (equity / rates / metals / energy / FX). Extend as desired.
+# Core diversified basket (equity / rates / metals / energy / FX), 11 markets. Extend as desired.
 # notice_buffer_days: how early to be OUT to dodge physical delivery (bonds/metals ~month;
 # oil monthly so tighter but > weekly cadence; ES cash-settled so small = liquidity only).
 FUTURES: list[FutureSpec] = [
@@ -76,6 +76,14 @@ FUTURES: list[FutureSpec] = [
     FutureSpec("rates_30y", "TLT", "ZB", "CBOT",  "USD", 1000,   102_800, notice_buffer_days=25),                 # phys. delivered; no micro
     FutureSpec("silver",    "SLV", "SI", "COMEX", "USD", 5000,   285_000, "SI",  1000,    57_000, notice_buffer_days=30),  # 1,000oz micro shares the "SI" symbol; the MULTIPLIER (1000 vs full 5000) selects it — localSymbol SILQ6, tradingClass SIL. phys. delivered
     FutureSpec("fx_jpy",    "FXY", "6J", "CME",   "USD", 12500000, 79_100, "MJY", 1250000, 7_910, notice_buffer_days=10),   # MJY = 1/10 micro (IB symbol; "M6J" does not resolve — Error 200)
+    # Natural gas (added 2026-10-26, doc H.25): passed the pre-registered new-markets test
+    # (algo_trading/scripts/trend_new_markets_lab.py); weekly correlation with oil only +0.18.
+    # Micro Henry Hub (MNG, 1,000 MMBtu, ~$3.5k) is FINANCIALLY settled, so no delivery risk and a
+    # short liquidity buffer (5d, like 1OZ). NG itself is physically delivered, hence 14d on the
+    # standard contract. MNG's last trade is the 4th-last business day of the month BEFORE the
+    # contract month; the roll logic works from IB's last-trade date, so that is handled as is.
+    FutureSpec("natgas",    "UNG", "NG", "NYMEX", "USD", 10000,  35_000, "MNG", 1000,   3_500,
+               notice_buffer_days=14, micro_notice_buffer_days=5),
 ]
 
 BY_MARKET: dict[str, FutureSpec] = {s.market: s for s in FUTURES}

@@ -53,7 +53,10 @@ def fingerprint(env: dict) -> str:
 # values were refreshed to that day's prices. Against the 2026-10-07 fixture ONLY the contract
 # values, gold's symbol and the contract counts that follow from them changed; config, signals,
 # vols and dollar targets are identical. The 2026-10-07 file is kept for that comparison.
-before = (Path(__file__).parent / "fixtures" / "sizing_fingerprint_2026-10-14.json").read_text().strip()
+# Re-pinned 2026-10-26, deliberately: natural gas (MNG) added as an 11th market (doc H.25). The
+# fixture draws one random price path per market, so the new market adds a column and N = 11 changes
+# every per-market risk share; config is identical. The 2026-10-14 file is kept for comparison.
+before = (Path(__file__).parent / "fixtures" / "sizing_fingerprint_2026-10-26.json").read_text().strip()
 
 
 def same(a: str, b: str, rel: float = 1e-9) -> bool:

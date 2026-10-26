@@ -9,11 +9,16 @@ Bitbucket-only (private) — not published.
 ## The strategy in one paragraph
 6- and 12-month time-series momentum (sign), daily → inverse-vol risk parity → 10% portfolio
 vol target, scaled by `OVERLAY_MULT`. Budget and overlay come from `config/capital_bases.json`
-($50k x 1.5 = $75k effective). Fixed 10-market basket (ES/MES, ZN, ZB, GC/1OZ, SI micro, HG/MHG,
-CL/MCL, 6E/M6E, 6A/M6A, 6J/MJY) — never rotated, only long/short/resized; a market is held only
+($50k x 1.5 = $75k effective). Fixed 11-market basket (ES/MES, ZN, ZB, GC/1OZ, SI micro, HG/MHG,
+CL/MCL, 6E/M6E, 6A/M6A, 6J/MJY, NG/MNG) — never rotated, only long/short/resized; a market is held only
 when one contract fits the per-market cap. Gold trades the cash-settled 1-ounce contract (1OZ).
 Physical-delivery safety: every position is force-closed inside its contract's buffer before last
 trade, so a missed roll can't become a delivery obligation.
+
+**First run after adding natural gas (MNG, 2026-10-26):** confirm IB resolves it (the log's
+`contract values:` line lists natgas, and no `front_future failed` / `contract value: natgas`
+warning appears). If MNG does not resolve, `front_future failed for MNG` is logged (so it reaches
+the email) and natgas simply gets no order; the other markets trade as normal.
 
 **First run after switching gold to 1OZ:** confirm IB resolves it (the log's `contract values:`
 line lists gold, and no `front_future failed` / `contract value: gold` warning appears).
